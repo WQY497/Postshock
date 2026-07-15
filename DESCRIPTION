@@ -1,0 +1,28 @@
+Package: postshock
+Type: Package
+Title: Post-Shock Forecasting with an Intercept Correction Modeling Framework
+Version: 0.2.0
+Authors@R:
+    c(
+      person("Qiyang", "Wang", email = "qiyangw3@illinois.edu", role = c("aut","cre")),
+      person("Daniel J.", "Eck", email = "dje13@illinois.edu", role = "aut")
+    )
+Description: Implements donor balancing weights (DBW) and related utilities
+    for post-shock time-series forecasting. The methods estimate a post-shock
+    intercept-correction term using information aggregated from donor series.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Depends: R (>= 3.5.0)
+Imports:
+    Rsolnp,
+    garchx,
+    forecast,
+    lmtest,
+    xts,
+    zoo
+Suggests:
+    testthat (>= 3.0.0)
+Config/testthat/edition: 3
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.3
+LazyData: true

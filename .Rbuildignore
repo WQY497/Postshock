@@ -1,0 +1,14 @@
+^.*\.Rproj$
+^\.Rproj\.user$
+^\.Rlibs$
+^\.vscode$
+^\.RData$
+^\.Rhistory$
+^\.DS_Store$
+^README\.Rmd$
+^LICENSE\.md$
+^scripts$
+^inst/notes$
+^inst/technical_report$
+^.*\.tar\.gz$
+^.*\.Rcheck$

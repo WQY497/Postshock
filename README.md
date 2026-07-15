@@ -1,2 +1,45 @@
-# Postshock
-An R package to implement post-shock forecasting methodology using an intercept correction modeling framework
+
+# postshock
+
+`postshock` is a small toolkit for **time-series forecasting around
+shocks/breaks**.  
+It helps you learn from the **pre-shock** window, forecast into the
+**post-shock** period, and optionally adjust those forecasts using
+information from **donor series**.
+
+------------------------------------------------------------------------
+
+## Highlights
+
+- **Donor Balancing Weights (`dbw`)**  
+  Compute donor weights on the pre-shock window so donors match the
+  target in covariates. Supports scaling/centering, bounds, and L1/L2
+  penalties.
+
+- **Automatic order selection (`auto_garchx`)**  
+  Grid search + IC selection for GARCH-X / GJR-GARCH with robust
+  covariance and backcast handling.
+
+- **Synthetic prediction (`SynthPrediction`)**  
+  Fit (S)ARIMA with a post-shock indicator on each donor, aggregate
+  donor “shock effects” via DBW (or uniform weights), and adjust the
+  target’s k-step forecast.
+
+- **Synthetic volatility forecasting (`SynthVolForecast`)**  
+  Forecast variance with a pre-shock GARCH-X on the target and add a
+  donor-based shock adjustment.
+
+- **Practical API**  
+  Clean function interfaces, guardrail tests, and documentation for
+  quick adoption.
+
+------------------------------------------------------------------------
+
+## Installation
+
+You can install the development version from GitHub with `devtools`:
+
+```r
+#install.packages("devtools")
+devtools::install_github(repo = "DEck13/postshock")
+```

@@ -1,0 +1,1405 @@
+---
+title: "Real_data_garchx"
+author: "Qiyang Wang"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    number_sections: yes
+    toc: true
+fontsize: 11pt
+geometry: margin=1in
+---
+
+```{r}
+library(postshock)
+```
+
+
+# simulation experiment
+```{r,echo=FALSE,warning=FALSE,message=FALSE}
+# ====== Dependencies ======
+library(garchx)
+library(zoo)
+
+# ====== 1) Simulation: GJR-GARCH(1,1) with an omega jump ======
+# d_omega > 0 means the constant term omega is increased after t0
+# (i.e., a level shift in variance)
+sim_gjr_omega_jump <- function(n, t0,
+                               omega = 0.02, d_omega = 0.06,
+                               alpha = 0.07, beta = 0.80, gamma = 0.25,
+                               seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  stopifnot(alpha + beta + 0.5 * gamma < 1)      # stationarity check
+
+  z <- rnorm(n)                                  # i.i.d. N(0,1)
+  h <- e <- numeric(n)
+
+  # Warm start using the unconditional variance under the pre-jump omega
+  h[1] <- omega / (1 - alpha - beta - 0.5 * gamma)
+  e[1] <- sqrt(h[1]) * z[1]
+
+  for (t in 2:n) {
+    # Use omega + d_omega after the shock time; omega otherwise
+    omega_t <- if (t > t0) omega + d_omega else omega
+    Ineg    <- as.numeric(e[t - 1] < 0)          # GJR indicator for negative shocks
+
+    # Conditional variance recursion
+    h[t] <- omega_t +
+      alpha * e[t - 1]^2 +
+      gamma * Ineg * e[t - 1]^2 +
+      beta  * h[t - 1]
+
+    # Return (innovation) with conditional std dev
+    e[t] <- sqrt(h[t]) * z[t]
+  }
+  list(y = e, h = h)                             # y = returns; h = true variance
+}
+
+# ====== 2) DBW-only feature construction from y (no covariates into GARCH) ======
+# These features are used only by DBW to compute donor weights
+# (covariate_indices = NULL below)
+make_dbw_features <- function(y, L = 10) {
+  v2 <- y^2
+
+  # Rolling second moments (partial = TRUE avoids NA prefixes)
+  msq5  <- rollapplyr(v2,  5, mean, partial = TRUE)
+  msq10 <- rollapplyr(v2, 10, mean, partial = TRUE)
+  msq20 <- rollapplyr(v2, 20, mean, partial = TRUE)
+
+  # Rolling volatility
+  vol10 <- rollapplyr(y, 10, sd, partial = TRUE)
+
+  # Shape expansion of the most recent L lags of y^2
+  lag_one <- function(x, k) {
+    if (k == 0) x else c(rep(x[1], k), x[1:(length(x) - k)])
+  }
+  lag_block <- sapply(0:(L - 1), function(k) lag_one(v2, k))
+  colnames(lag_block) <- paste0("v2_lag", 0:(L - 1))
+
+  as.data.frame(cbind(msq5, msq10, msq20, vol10, lag_block))
+}
+
+# ====== 3) Generate target + 3 donors (same t0, different jump sizes) ======
+set.seed(2025)
+n  <- 1600
+t0 <- 1200
+
+# target: medium jump; donors: strong / medium / weak jumps
+tar <- sim_gjr_omega_jump(n, t0, d_omega = 0.06)
+d1  <- sim_gjr_omega_jump(n, t0, d_omega = 0.08)
+d2  <- sim_gjr_omega_jump(n, t0, d_omega = 0.04)
+d3  <- sim_gjr_omega_jump(n, t0, d_omega = 0.02)
+
+Y_series_list <- list(tar$y, d1$y, d2$y, d3$y)
+
+# Build DBW features for target + donors (used only for weighting)
+target_covariates      <- make_dbw_features(tar$y, L = 10)
+covariates_series_list <- lapply(Y_series_list[-1], make_dbw_features, L = 10)
+
+# ====== 4) Shock metadata ======
+# Persistent omega jump: indicator stays 1 from t0+1 to the end of the sample
+permanent_jump <- TRUE
+if (permanent_jump) {
+  shock_time_vec <- rep(as.integer(t0), length(Y_series_list))
+  shock_length_vec <- vapply(
+    Y_series_list,
+    function(y) pmax(1L, as.integer(length(y) - as.integer(t0))),
+    integer(1L)
+  )
+} else {
+  # Transient shock example: here you could set different finite lengths
+  shock_time_vec <- rep(as.integer(t0), length(Y_series_list))
+  shock_length_vec <- vapply(
+    Y_series_list,
+    function(y) pmax(1L, as.integer(length(y) - as.integer(t0))),
+    integer(1L)
+  )
+}
+
+# ====== 5) Single test wrapper: call SynthVolForecast and compare to truth ======
+run_once <- function(k) {
+  stopifnot(k >= 1, k == as.integer(k))
+
+  # Call your SynthVolForecast:
+  # - Feed DBW with features (no covariates into GARCH; covariate_indices = NULL)
+  # - Use all columns from target_covariates for DBW
+  res <- SynthVolForecast(
+    Y_series_list          = Y_series_list,
+    covariates_series_list = covariates_series_list,
+    target_covariates      = target_covariates,
+    shock_time_vec         = shock_time_vec,
+    shock_length_vec       = shock_length_vec,
+    k                      = k,
+    dbw_indices            = 1:ncol(target_covariates),
+    covariate_indices      = NULL,
+    max.p = 3, max.q = 3,
+    plots = FALSE
+  )
+
+  # Compare adjusted prediction vs true variance over k steps after t0
+  pred_adj <- as.numeric(res$predictions$adjusted)
+  pred_raw <- as.numeric(res$predictions$unadjusted)
+  truev    <- tar$h[(t0 + 1):(t0 + k)]
+
+  # Basic metrics
+  mse_adj  <- mean((pred_adj - truev)^2)
+  mae_adj  <- mean(abs(pred_adj - truev))
+  corr_adj <- if (k > 1) suppressWarnings(cor(pred_adj, truev)) else NA_real_
+
+  # Step-by-step table for quick inspection
+  tab <- data.frame(
+    step            = seq_len(k),
+    true_var        = truev,
+    pred_raw        = pred_raw,
+    pred_adj        = pred_adj,
+    diff_adj        = pred_adj - truev,
+    abs_pct_err_adj = 100 * abs(pred_adj - truev) / truev
+  )
+  tab[] <- lapply(tab, function(x) if (is.numeric(x)) round(x, 6) else x)
+  print(tab, row.names = FALSE)
+
+  cat(sprintf(
+    "\n[k=%d]  MSE(true, adj)=%.6f | MAE=%.6f | Corr=%s\n",
+    k, mse_adj, mae_adj, if (is.na(corr_adj)) "NA" else sprintf("%.3f", corr_adj)
+  ))
+
+  # Show DBW weights and each donor's estimated shock effect
+  cat("weights (w_hat): ", paste(round(res$meta$weights, 3), collapse = ", "), "\n")
+  cat("omega by donor : ", paste(round(res$meta$omega_vec, 3), collapse = ", "), "\n")
+  cat("combined omega : ", round(res$meta$combined_omega, 3), "\n\n")
+
+  # Mini plot (even k = 1 shows points)
+  x <- seq_len(k)
+  ylim <- range(c(truev, pred_adj, pred_raw), finite = TRUE)
+  plot(x, truev,
+       type = if (k > 1) "l" else "p", pch = 19,
+       lwd = 2, col = "black",
+       main = sprintf("True vs Predicted variance (k=%d)", k),
+       xlab = "horizon (step)", ylab = "variance",
+       ylim = ylim)
+  lines(x, pred_adj, lwd = 2, col = "red", lty = 2)
+  if (k == 1) points(x, pred_adj, pch = 17, col = "red", cex = 1.1)
+  lines(x, pred_raw, lwd = 1, col = "grey40", lty = 3)
+  if (k == 1) points(x, pred_raw, pch = 15, col = "grey40", cex = 1.1)
+  legend("topleft",
+         c("true", "pred (adjusted)", "pred (raw)"),
+         lwd = c(2, 2, 1), lty = c(1, 2, 3),
+         pch = c(19, if (k == 1) 17 else NA, if (k == 1) 15 else NA),
+         col = c("black", "red", "grey40"), bty = "n")
+
+  invisible(list(
+    res     = res,
+    table   = tab,
+    metrics = list(mse = mse_adj, mae = mae_adj, corr = corr_adj)
+  ))
+}
+
+cat("=== omega-jump: single-origin testing (k = 1-2) ===\n")
+res_k1 <- run_once(k = 1)
+res_k2 <- run_once(k = 2)
+
+```
+
+
+# real data experiment
+## Theoretical Basis for the Real-Data Experiment
+
+Our real-data experiment focuses on **post-shock volatility forecasting** rather than mean forecasting. The key idea is that GARCH-type models do not model price levels directly; instead, they model the **time-varying conditional variance** of a return or innovation process.
+
+Let
+$$
+r_t = \mu_t + \epsilon_t, \qquad \epsilon_t = \sigma_t \eta_t,
+$$
+where \(r_t\) is the observed return, \(\mu_t\) is the conditional mean, \(\epsilon_t\) is the innovation, and \(\sigma_t^2\) is the conditional variance. In this framework, GARCH models the dynamics of \(\sigma_t^2\), not the mean itself. Thus, the usual input to GARCH is a **return series** or a **mean-corrected residual series**, while the object of interest is its volatility.
+
+This also explains the relation between ARIMA and GARCH. ARIMA mainly describes the **conditional mean structure**, while GARCH adds a second layer to describe the **conditional variance structure** of the innovation process. For financial returns, the mean is often weak, while volatility clustering is strong, making GARCH-type modeling especially suitable.
+
+GARCHX extends GARCH by allowing exogenous variables to enter the variance equation:
+$$
+\sigma_t^2
+=
+\omega + \alpha \epsilon_{t-1}^2 + \beta \sigma_{t-1}^2 + \lambda^\top x_t.
+$$
+Here, \(x_t\) may include market covariates or shock-related variables. Therefore, GARCHX is appropriate when post-shock volatility may be affected not only by lagged shocks and lagged variance, but also by external information such as uncertainty measures, interest rates, or a post-shock indicator.
+
+In our setting, the target series is a return-like financial series, so using daily log returns as the GARCHX input is theoretically appropriate. The model is then used to forecast short-horizon post-shock volatility.
+
+Our current `SynthVolForecast` framework adds a donor-based adjustment on top of the target-side volatility forecast. The logic is as follows:
+
+1. Fit donor episodes with a GARCHX specification containing a post-shock indicator.
+2. Extract donor-specific post-shock effects.
+3. Combine these effects using donor-basis weights.
+4. Add the weighted shock effect to the target’s baseline volatility forecast.
+
+This design is especially reasonable because our goal is to forecast the **first one or two days after the shock**, rather than the full long-run recovery path. Therefore, the donor-weighted additive shock correction should be interpreted as a **short-horizon post-shock volatility uplift adjustment**.
+
+Finally, in real data, the true conditional variance is latent and cannot be directly observed. As a result, the model input and the forecast evaluation target must be distinguished: returns or residuals are used for modeling, while volatility proxies are used for empirical evaluation.
+
+
+## Candidate Donor Pools and Software Workflow
+
+To make the donor-pool design transparent, we treat donor-pool choice as an analyst-specified input rather than something determined by ex post forecast performance. The target episode in this application is the 2016 Election. Given a specified donor pool, our software can quickly return the corresponding post-shock volatility forecast, which makes it straightforward to compare outputs across competing donor-pool specifications within a common framework. In this application, we consider several substantively motivated donor-pool constructions based on earlier political and macro-uncertainty events that may be relevant to short-horizon post-shock volatility in the financial sector.
+
+### Full Candidate Donor Pool
+
+In this application, the full candidate donor pool includes the 2004 Election, 2008 Election, 2012 Election, Brexit Announced, Brexit Poll Released, and Brexit. This provides the broadest donor-pool specification considered in the empirical comparison.
+
+Given this full donor-pool specification, the corresponding target and donor inputs can be constructed directly from the episode panels and passed into the common forecasting workflow.
+
+```{r}
+# =========================
+# Step 1: define episode metadata
+# =========================
+
+target_symbol <- "IYG"
+pre_n_default <- 500
+post_buffer_default <- 10
+
+episode_meta <- data.frame(
+  episode_name = c(
+    "2016 Election",
+    "Brexit",
+    "Brexit Poll Released",
+    "Brexit Announced",
+    "2012 Election",
+    "2004 Election",
+    "2008 Election"
+  ),
+  shock_date = as.Date(c(
+    "2016-11-08",
+    "2016-06-23",
+    "2016-06-13",
+    "2016-02-19",
+    "2012-11-06",
+    "2004-11-02",
+    "2008-11-04"
+  )),
+  asset = target_symbol,
+  pre_n = pre_n_default,
+  post_buffer = post_buffer_default
+)
+
+episode_meta <- episode_meta[order(episode_meta$shock_date), ]
+rownames(episode_meta) <- NULL
+
+print(episode_meta)
+
+
+```
+
+```{r, include=FALSE, warning=FALSE, message=FALSE}
+# =========================
+# Step 2: download raw market data
+# =========================
+
+library(quantmod)
+
+# symbols used in the real-data experiment
+symbols_to_download <- c(
+  "IYG",    # target ETF
+  "CL=F",   # crude oil futures
+  "^VIX",   # VIX
+  "^IRX",   # short-rate proxy
+  "^TNX"    # long-rate proxy
+)
+
+# choose one wide date range for all episodes
+start_date_all <- min(episode_meta$shock_date) - 2000
+end_date_all   <- max(episode_meta$shock_date) + 60
+
+print(start_date_all)
+print(end_date_all)
+
+# helper: safely download one symbol
+get_symbol_data <- function(sym, from, to) {
+  obj <- try(
+    suppressWarnings(
+      getSymbols(
+        Symbols = sym,
+        src = "yahoo",
+        from = from,
+        to = to,
+        auto.assign = FALSE
+      )
+    ),
+    silent = TRUE
+  )
+  
+  if (inherits(obj, "try-error")) {
+    warning(paste("Download failed for:", sym))
+    return(NULL)
+  }
+  
+  obj
+}
+
+# download into a named list
+raw_market_data <- setNames(
+  lapply(symbols_to_download, get_symbol_data,
+         from = start_date_all, to = end_date_all),
+  symbols_to_download
+)
+
+# check download status
+download_ok <- sapply(raw_market_data, function(x) !is.null(x))
+print(download_ok)
+
+# preview
+head(raw_market_data[["IYG"]])
+head(raw_market_data[["^VIX"]])
+
+```
+
+```{r, include=FALSE, warning=FALSE, message=FALSE}
+# =========================
+# Step 3: build a clean market panel
+# =========================
+
+library(xts)
+library(zoo)
+library(quantmod)
+
+# 1. extract adjusted/close prices
+IYG_close <- Ad(raw_market_data[["IYG"]])
+CLF_close <- Ad(raw_market_data[["CL=F"]])
+
+# for VIX / IRX / TNX, use Close
+VIX_close <- Cl(raw_market_data[["^VIX"]])
+IRX_close <- Cl(raw_market_data[["^IRX"]])
+TNX_close <- Cl(raw_market_data[["^TNX"]])
+
+# 2. build transformed series
+ret_IYG <- dailyReturn(IYG_close, type = "log")
+colnames(ret_IYG) <- "ret_IYG"
+
+ret_CLF <- dailyReturn(CLF_close, type = "log")
+colnames(ret_CLF) <- "ret_CLF"
+
+VIX_level <- VIX_close
+colnames(VIX_level) <- "VIX_level"
+
+dIRX <- diff(IRX_close)
+colnames(dIRX) <- "dIRX"
+
+dTNX <- diff(TNX_close)
+colnames(dTNX) <- "dTNX"
+
+# 3. merge into one panel
+market_panel <- merge(
+  ret_IYG,
+  ret_CLF,
+  VIX_level,
+  dIRX,
+  dTNX,
+  join = "inner"
+)
+
+# 4. drop NA rows
+market_panel <- na.omit(market_panel)
+
+# 5. quick check
+head(market_panel)
+str(market_panel)
+
+
+```
+
+```{r, include=FALSE, warning=FALSE, message=FALSE}
+# =========================
+# Step 4: build one episode panel
+# =========================
+
+build_episode_panel <- function(panel_xts, shock_date, pre_n = 500, post_buffer = 10) {
+  shock_date <- as.Date(shock_date)
+  
+  all_dates <- index(panel_xts)
+  
+  if (!(shock_date %in% all_dates)) {
+    stop(paste("Shock date not found in panel:", shock_date))
+  }
+  
+  shock_idx <- which(all_dates == shock_date)
+  
+  start_idx <- shock_idx - pre_n
+  end_idx   <- shock_idx + post_buffer
+  
+  if (start_idx < 1) {
+    stop("Not enough pre-shock observations for this episode.")
+  }
+  
+  if (end_idx > nrow(panel_xts)) {
+    stop("Not enough post-shock observations for this episode.")
+  }
+  
+  episode_panel <- panel_xts[start_idx:end_idx, ]
+  
+  return(list(
+    panel = episode_panel,
+    shock_date = shock_date,
+    shock_index_in_panel = pre_n + 1,
+    shock_index_in_market_panel = shock_idx,
+    start_date = index(episode_panel)[1],
+    end_date = index(episode_panel)[nrow(episode_panel)]
+  ))
+}
+
+# test on 2016 Election
+ep_2016 <- build_episode_panel(
+  panel_xts = market_panel,
+  shock_date = as.Date("2016-11-08"),
+  pre_n = 500,
+  post_buffer = 10
+)
+
+# check results
+ep_2016$shock_date
+ep_2016$shock_index_in_panel
+ep_2016$start_date
+ep_2016$end_date
+dim(ep_2016$panel)
+
+head(ep_2016$panel)
+tail(ep_2016$panel)
+```
+
+```{r,echo=FALSE}
+# =========================
+# Step 5: build all episode panels
+# =========================
+
+build_all_episode_panels <- function(panel_xts, episode_meta) {
+  episode_list <- vector("list", nrow(episode_meta))
+  names(episode_list) <- episode_meta$episode_name
+  
+  for (i in seq_len(nrow(episode_meta))) {
+    episode_name_i <- episode_meta$episode_name[i]
+    shock_date_i   <- episode_meta$shock_date[i]
+    pre_n_i        <- episode_meta$pre_n[i]
+    post_buffer_i  <- episode_meta$post_buffer[i]
+    
+    episode_list[[i]] <- build_episode_panel(
+      panel_xts = panel_xts,
+      shock_date = shock_date_i,
+      pre_n = pre_n_i,
+      post_buffer = post_buffer_i
+    )
+  }
+  
+  episode_list
+}
+
+# build all episode panels
+episode_data_list <- build_all_episode_panels(
+  panel_xts = market_panel,
+  episode_meta = episode_meta
+)
+
+# check names
+names(episode_data_list)
+
+# quick check: dimensions of each episode panel
+sapply(episode_data_list, function(x) dim(x$panel)[1])
+
+# quick check: shock dates
+sapply(episode_data_list, function(x) as.character(x$shock_date))
+
+# summary table for all episodes
+episode_summary <- data.frame(
+  episode_name = names(episode_data_list),
+  shock_date = sapply(episode_data_list, function(x) as.character(x$shock_date)),
+  start_date = sapply(episode_data_list, function(x) as.character(x$start_date)),
+  end_date = sapply(episode_data_list, function(x) as.character(x$end_date)),
+  shock_index_in_panel = sapply(episode_data_list, function(x) x$shock_index_in_panel),
+  n_rows = sapply(episode_data_list, function(x) nrow(x$panel)),
+  stringsAsFactors = FALSE
+)
+
+print(episode_summary)
+head(episode_data_list[["2016 Election"]]$panel)
+tail(episode_data_list[["2016 Election"]]$panel)
+dim(episode_data_list[["2016 Election"]]$panel)
+colnames(episode_data_list[["2016 Election"]]$panel)
+```
+
+```{r,include=FALSE}
+for (nm in names(episode_data_list)) {
+  cat("\n====================\n")
+  cat("Event:", nm, "\n")
+  
+  panel_i <- episode_data_list[[nm]]$panel
+  shock_idx_i <- episode_data_list[[nm]]$shock_index_in_panel
+  
+  tmp <- data.frame(
+    rel_day = -5:5,
+    date = index(panel_i)[(shock_idx_i - 5):(shock_idx_i + 5)],
+    ret_IYG = as.numeric(panel_i[(shock_idx_i - 5):(shock_idx_i + 5), "ret_IYG"])
+  )
+  
+  tmp$abs_ret <- abs(tmp$ret_IYG)
+  print(tmp)
+  
+  cat("Largest abs return in this window:\n")
+  print(tmp[which.max(tmp$abs_ret), ])
+}
+
+```
+
+As a preliminary descriptive diagnostic, we inspected the local [-5, +5] window around each candidate episode and examined the timing of the largest absolute return. This exercise was used only as a plausibility check on local event dynamics and not as a formal donor-selection rule. The restricted donor set is instead motivated by ex ante comparability in event type, economic interpretation, and financial-sector relevance.
+
+### Full Donor-Pool Forecast Result
+
+The full donor pool serves as a broad benchmark specification. Its main advantage is that it avoids excessive screening and allows the donor-adjustment procedure to incorporate a wider range of historical episodes. This specification is useful for robustness, since it reduces the risk that the reported results are driven by a narrowly selected donor set.
+
+```{r, include=FALSE, warning=FALSE, message=FALSE}
+# =========================
+# Step 6: build SynthVolForecast inputs using ALL donors
+# =========================
+
+# choose target
+target_event <- "2016 Election"
+
+# use all other episodes as donors
+donor_events <- setdiff(names(episode_data_list), target_event)
+
+# optional: print donor set
+donor_events
+
+# helper: convert one episode panel to Y and X
+extract_episode_inputs <- function(ep_obj) {
+  panel_i <- ep_obj$panel
+
+  # Y: target asset return
+  Y_i <- as.numeric(panel_i[, "ret_IYG"])
+
+  # X: covariates for DBW
+  X_i <- data.frame(
+    ret_CLF   = as.numeric(panel_i[, "ret_CLF"]),
+    VIX_level = as.numeric(panel_i[, "VIX_level"]),
+    dIRX      = as.numeric(panel_i[, "dIRX"]),
+    dTNX      = as.numeric(panel_i[, "dTNX"])
+  )
+
+  list(Y = Y_i, X = X_i)
+}
+
+# target inputs
+target_obj <- extract_episode_inputs(episode_data_list[[target_event]])
+
+# donor inputs
+donor_obj_list <- lapply(donor_events, function(nm) {
+  extract_episode_inputs(episode_data_list[[nm]])
+})
+names(donor_obj_list) <- donor_events
+
+# assemble SynthVolForecast inputs
+Y_series_list <- c(
+  list(target_obj$Y),
+  lapply(donor_obj_list, function(x) x$Y)
+)
+
+target_covariates <- target_obj$X
+
+covariates_series_list <- lapply(donor_obj_list, function(x) x$X)
+
+# keep the same one-step shock setup
+shock_time_vec <- rep(501, length(Y_series_list))
+shock_length_vec <- rep(1, length(Y_series_list))
+
+shock_time_labels <- c(target_event, donor_events)
+
+# quick checks
+length(Y_series_list)
+length(covariates_series_list)
+dim(target_covariates)
+
+sapply(Y_series_list, length)
+sapply(covariates_series_list, nrow)
+sapply(covariates_series_list, ncol)
+
+shock_time_vec
+shock_length_vec
+shock_time_labels
+```
+
+```{r,warning=FALSE,echo=TRUE,message=FALSE,cache=TRUE}
+svf_out_all <- SynthVolForecast(
+  Y_series_list = Y_series_list,
+  covariates_series_list = covariates_series_list,
+  target_covariates = target_covariates,
+  shock_time_vec = shock_time_vec,
+  shock_length_vec = shock_length_vec,
+  k = 1,
+  dbw_indices = 1:ncol(target_covariates),
+  covariate_indices = NULL,
+  plots = FALSE,
+  return_fits = TRUE,
+  max.p = 3,
+  max.q = 3,
+  vcov.type = "robust"
+)
+
+svf_out_all$predictions
+svf_out_all$meta$weights
+svf_out_all$meta$omega_vec
+Y_series_list[[1]][502]^2
+
+```
+
+```{r all-donor-figure, warning=FALSE, echo=FALSE, fig.width=8, fig.height=5}
+library(ggplot2)
+
+# target episode
+ep_panel <- episode_data_list[["2016 Election"]]$panel
+shock_idx <- episode_data_list[["2016 Election"]]$shock_index_in_panel
+forecast_idx <- shock_idx + 1
+
+# last 30 days plus forecast day
+hist_idx <- (forecast_idx - 30):forecast_idx
+
+hist_df <- data.frame(
+  day = 1:31,
+  value = abs(as.numeric(ep_panel[hist_idx, "ret_IYG"]))
+)
+
+# all-donor forecast-day comparison
+compare_df <- data.frame(
+  day = c(31, 31.10, 31.20, 31.30),
+  value = c(
+    abs(as.numeric(ep_panel[forecast_idx, "ret_IYG"])),
+    sqrt(svf_out_all$predictions$unadjusted),
+    sqrt(svf_out_all$predictions$adjusted),
+    sqrt(svf_out_all$predictions$arithmetic_mean)
+  ),
+  type = factor(
+    c("Observed", "Unadjusted", "Adjusted", "Arithmetic mean"),
+    levels = c("Observed", "Unadjusted", "Adjusted", "Arithmetic mean")
+  )
+)
+
+ggplot() +
+  geom_line(data = hist_df, aes(day, value), color = "black", linewidth = 0.5) +
+  geom_point(data = hist_df, aes(day, value), color = "black", size = 2) +
+  geom_point(
+    data = compare_df,
+    aes(day, value, color = type, shape = type),
+    size = 3.5
+  ) +
+  scale_color_manual(values = c(
+    "Observed" = "black",
+    "Unadjusted" = "mediumpurple",
+    "Adjusted" = "tomato",
+    "Arithmetic mean" = "olivedrab3"
+  )) +
+  scale_shape_manual(values = c(
+    "Observed" = 16,
+    "Unadjusted" = 18,
+    "Adjusted" = 16,
+    "Arithmetic mean" = 17
+  )) +
+  scale_x_continuous(
+    breaks = c(1, 10, 20, 30, 31),
+    labels = c("1", "10", "20", "30", "Forecast"),
+    limits = c(1, 31.5)
+  ) +
+  labs(
+    title = "IYG local volatility trend and forecast-day comparison (all donors)",
+    x = "Day in local shock window",
+    y = "Volatility proxy scale",
+    color = NULL,
+    shape = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "right"
+  )
+
+```
+
+Under the full donor-pool specification, the software returns a donor-adjusted one-step-ahead volatility forecast that is substantially above the no-donor baseline forecast. In this episode, the target-only baseline forecast is very small relative to the observed next-day variance proxy, whereas both the donor-adjusted forecast and the arithmetic-mean benchmark imply a much larger short-horizon post-shock volatility response. This indicates that, even under a broad donor pool, donor information continues to suggest a sizable volatility uplift beyond the target-side pre-shock forecast.
+
+A donor-level inspection suggests that the full-pool adjustment is not driven uniformly by all election episodes. In particular, the 2004 Election receives substantial weight but contributes little because its estimated donor-side shock effect is close to zero, while Brexit contributes most strongly because it combines a large weight with a nontrivial estimated shock effect.
+
+### Restricted Donor Set
+
+A second analyst choice is to work with a more focused donor pool based on ex ante comparability. In this application, we consider a restricted donor set consisting of the 2012 Election, Brexit Poll Released, and Brexit. This restriction is not based on ex post forecast performance or on whether donor-side estimated shock effects are statistically significant. Rather, it reflects a substantive judgment that these episodes provide a more focused set of historical analogs for the 2016 Election. The 2012 Election is the closest event in type to the target episode, while Brexit Poll Released and Brexit capture discrete political uncertainty shocks with plausible spillovers to global risk sentiment and the financial sector. Given this restricted donor-pool specification, the corresponding target and donor inputs can be constructed directly from the episode panels and passed into the common forecasting workflow.
+
+```{r, include=FALSE, warning=FALSE, message=FALSE}
+# =========================
+# Step 6: build SynthVolForecast inputs
+# =========================
+
+# events we keep for the first real-data run
+event <- c(
+  "2012 Election",
+  "Brexit Poll Released",
+  "Brexit",
+  "2016 Election"
+)
+
+target_event <- "2016 Election"
+donor_events <- setdiff(event, target_event)
+
+# helper: convert one episode panel to Y and X
+extract_episode_inputs <- function(ep_obj) {
+  panel_i <- ep_obj$panel
+  
+  # Y: target asset return
+  Y_i <- as.numeric(panel_i[, "ret_IYG"])
+  
+  # X: simple environment covariates for DBW
+  X_i <- data.frame(
+    ret_CLF   = as.numeric(panel_i[, "ret_CLF"]),
+    VIX_level = as.numeric(panel_i[, "VIX_level"]),
+    dIRX      = as.numeric(panel_i[, "dIRX"]),
+    dTNX      = as.numeric(panel_i[, "dTNX"])
+  )
+  
+  list(Y = Y_i, X = X_i)
+}
+
+# target inputs
+target_obj <- extract_episode_inputs(episode_data_list[[target_event]])
+
+# donor inputs
+donor_obj_list <- lapply(donor_events, function(nm) {
+  extract_episode_inputs(episode_data_list[[nm]])
+})
+names(donor_obj_list) <- donor_events
+
+# assemble SynthVolForecast inputs
+Y_series_list <- c(
+  list(target_obj$Y),
+  lapply(donor_obj_list, function(x) x$Y)
+)
+
+target_covariates <- target_obj$X
+
+covariates_series_list <- lapply(donor_obj_list, function(x) x$X)
+
+# since the market reaction is on the next trading day,
+# keep shock_time at the event day index, and let shock_length = 1
+# so the post-shock indicator turns on only for day +1
+shock_time_vec <- rep(501, length(Y_series_list))
+shock_length_vec <- rep(1, length(Y_series_list))
+
+shock_time_labels <- c(target_event, donor_events)
+
+# quick checks
+length(Y_series_list)
+length(covariates_series_list)
+dim(target_covariates)
+
+sapply(Y_series_list, length)
+sapply(covariates_series_list, nrow)
+sapply(covariates_series_list, ncol)
+
+shock_time_vec
+shock_length_vec
+shock_time_labels
+
+
+
+```
+
+### Restricted Donor-Pool Forecast Result
+
+```{r,warning=FALSE,echo=TRUE}
+
+svf_out_k1 <- SynthVolForecast(
+  Y_series_list = Y_series_list,
+  covariates_series_list = covariates_series_list,
+  target_covariates = target_covariates,
+  shock_time_vec = shock_time_vec,
+  shock_length_vec = shock_length_vec,
+  k = 1,
+  dbw_indices = 1:ncol(target_covariates),
+  covariate_indices = NULL,
+  plots = FALSE,
+  return_fits = TRUE,
+  max.p = 3,
+  max.q = 3,
+  vcov.type = "robust"
+)
+
+target_reaction_proxy <- Y_series_list[[1]][502]^2
+svf_out_k1$predictions$unadjusted
+svf_out_k1$predictions$adjusted
+svf_out_k1$predictions$arithmetic_mean
+target_reaction_proxy
+
+```
+
+```{r,warning=FALSE,echo=FALSE}
+library(ggplot2)
+
+# target case
+ep_panel <- episode_data_list[["2016 Election"]]$panel
+shock_idx <- episode_data_list[["2016 Election"]]$shock_index_in_panel
+forecast_idx <- shock_idx + 1
+
+# last 30 days plus the observed forecast day
+hist_idx <- (forecast_idx - 30):forecast_idx
+
+hist_df <- data.frame(
+  day = 1:31,
+  value = abs(as.numeric(ep_panel[hist_idx, "ret_IYG"]))
+)
+
+# forecast-day comparison points
+compare_df <- data.frame(
+  day = c(31, 31.10, 31.20, 31.30),
+  value = c(
+    abs(as.numeric(ep_panel[forecast_idx, "ret_IYG"])),
+    sqrt(svf_out_k1$predictions$unadjusted),
+    sqrt(svf_out_k1$predictions$adjusted),
+    sqrt(svf_out_k1$predictions$arithmetic_mean)
+  ),
+  type = c("Observed", "Unadjusted", "Adjusted", "Arithmetic mean")
+)
+
+ggplot() +
+  geom_line(data = hist_df, aes(day, value), color = "black") +
+  geom_point(data = hist_df, aes(day, value), color = "black", size = 2) +
+  geom_point(
+    data = compare_df,
+    aes(day, value, color = type, shape = type),
+    size = 3.5
+  ) +
+  scale_color_manual(values = c(
+    "Observed" = "black",
+    "Unadjusted" = "mediumpurple",
+    "Adjusted" = "tomato",
+    "Arithmetic mean" = "olivedrab3"
+  )) +
+  scale_shape_manual(values = c(
+    "Observed" = 16,
+    "Unadjusted" = 18,
+    "Adjusted" = 16,
+    "Arithmetic mean" = 17
+  )) +
+  scale_x_continuous(
+    breaks = c(1, 10, 20, 30, 31),
+    labels = c("1", "10", "20", "30", "Forecast"),
+    limits = c(1, 31.5)
+  ) +
+  labs(
+    title = "IYG local volatility trend and forecast-day comparison",
+    x = "Day in local shock window",
+    y = "Volatility scale",
+    color = NULL,
+    shape = NULL
+  ) +
+  theme_minimal()
+
+
+
+
+```
+
+Under the restricted donor-pool specification, the software returns a donor-adjusted one-step-ahead volatility forecast that is substantially above the no-donor baseline forecast. In this episode, the donor-adjusted variance forecast is approximately 0.001516, compared with a no-donor baseline forecast of about 0.000068. The arithmetic-mean benchmark is approximately 0.001310, while the observed next-day variance proxy is about 0.001750. Thus, both donor-based forecasts are substantially above the no-donor baseline, indicating that donor information under the restricted pool implies a sizable short-horizon post-shock volatility uplift. Because this donor pool is defined on ex ante comparability grounds, the resulting forecast should be interpreted as the output associated with a focused set of historical analogs rather than as a pool chosen on the basis of ex post performance.
+
+
+### Elections-Only Donor Pool
+
+A third analyst choice is to use a donor pool consisting only of past U.S. presidential elections. In this application, we consider an elections-only donor pool made up of the 2004 Election, 2008 Election, and 2012 Election. This specification is also defined on ex ante grounds rather than on ex post forecast performance. Its main appeal is that all donor episodes are of the same event type as the 2016 Election target episode, which makes the pool especially transparent from an event-comparability perspective. At the same time, these elections occurred under different market environments, so this pool also provides a useful intermediate specification between the full candidate donor pool and the more focused restricted donor set. Given this elections-only donor-pool specification, the corresponding target and donor inputs can be constructed directly from the episode panels and passed into the common forecasting workflow.
+
+```{r}
+# =========================
+# Elections-only donor pool
+# =========================
+
+# define elections-only pool
+event <- c(
+  "2004 Election",
+  "2008 Election",
+  "2012 Election",
+  "2016 Election"
+)
+
+target_event <- "2016 Election"
+donor_events <- setdiff(event, target_event)
+
+# helper: convert one episode panel to Y and X
+extract_episode_inputs <- function(ep_obj) {
+  panel_i <- ep_obj$panel
+  
+  Y_i <- as.numeric(panel_i[, "ret_IYG"])
+  
+  X_i <- data.frame(
+    ret_CLF   = as.numeric(panel_i[, "ret_CLF"]),
+    VIX_level = as.numeric(panel_i[, "VIX_level"]),
+    dIRX      = as.numeric(panel_i[, "dIRX"]),
+    dTNX      = as.numeric(panel_i[, "dTNX"])
+  )
+  
+  list(Y = Y_i, X = X_i)
+}
+
+# target inputs
+target_obj <- extract_episode_inputs(episode_data_list[[target_event]])
+
+# donor inputs
+donor_obj_list <- lapply(donor_events, function(nm) {
+  extract_episode_inputs(episode_data_list[[nm]])
+})
+names(donor_obj_list) <- donor_events
+
+# assemble SynthVolForecast inputs
+Y_series_list <- c(
+  list(target_obj$Y),
+  lapply(donor_obj_list, function(x) x$Y)
+)
+
+target_covariates <- target_obj$X
+covariates_series_list <- lapply(donor_obj_list, function(x) x$X)
+
+# shock metadata
+shock_time_vec <- rep(501, length(Y_series_list))
+shock_length_vec <- rep(1, length(Y_series_list))
+
+# fit elections-only specification
+svf_out_elec <- SynthVolForecast(
+  Y_series_list = Y_series_list,
+  covariates_series_list = covariates_series_list,
+  target_covariates = target_covariates,
+  shock_time_vec = shock_time_vec,
+  shock_length_vec = shock_length_vec,
+  k = 1,
+  dbw_indices = 1:ncol(target_covariates),
+  covariate_indices = NULL,
+  plots = FALSE,
+  return_fits = TRUE,
+  max.p = 3,
+  max.q = 3,
+  vcov.type = "robust"
+)
+
+target_reaction_proxy <- Y_series_list[[1]][502]^2
+
+svf_out_elec$predictions$unadjusted
+svf_out_elec$predictions$adjusted
+svf_out_elec$predictions$arithmetic_mean
+target_reaction_proxy
+
+```
+```{r elections-only-figure, warning=FALSE, echo=FALSE, fig.width=8, fig.height=5}
+library(ggplot2)
+
+# target episode
+ep_panel <- episode_data_list[["2016 Election"]]$panel
+shock_idx <- episode_data_list[["2016 Election"]]$shock_index_in_panel
+forecast_idx <- shock_idx + 1
+
+# last 30 days plus forecast day
+hist_idx <- (forecast_idx - 30):forecast_idx
+
+hist_df <- data.frame(
+  day = 1:31,
+  value = abs(as.numeric(ep_panel[hist_idx, "ret_IYG"]))
+)
+
+# elections-only forecast-day comparison
+compare_df <- data.frame(
+  day = c(31, 31.10, 31.20, 31.30),
+  value = c(
+    abs(as.numeric(ep_panel[forecast_idx, "ret_IYG"])),
+    sqrt(svf_out_elec$predictions$unadjusted),
+    sqrt(svf_out_elec$predictions$adjusted),
+    sqrt(svf_out_elec$predictions$arithmetic_mean)
+  ),
+  type = factor(
+    c("Observed", "Unadjusted", "Adjusted", "Arithmetic mean"),
+    levels = c("Observed", "Unadjusted", "Adjusted", "Arithmetic mean")
+  )
+)
+
+ggplot() +
+  geom_line(data = hist_df, aes(day, value), color = "black", linewidth = 0.5) +
+  geom_point(data = hist_df, aes(day, value), color = "black", size = 2) +
+  geom_point(
+    data = compare_df,
+    aes(day, value, color = type, shape = type),
+    size = 3.5
+  ) +
+  scale_color_manual(values = c(
+    "Observed" = "black",
+    "Unadjusted" = "mediumpurple",
+    "Adjusted" = "tomato",
+    "Arithmetic mean" = "olivedrab3"
+  )) +
+  scale_shape_manual(values = c(
+    "Observed" = 16,
+    "Unadjusted" = 18,
+    "Adjusted" = 16,
+    "Arithmetic mean" = 17
+  )) +
+  scale_x_continuous(
+    breaks = c(1, 10, 20, 30, 31),
+    labels = c("1", "10", "20", "30", "Forecast"),
+    limits = c(1, 31.5)
+  ) +
+  labs(
+    title = "IYG local volatility trend and forecast-day comparison (elections only)",
+    x = "Day in local shock window",
+    y = "Volatility proxy scale",
+    color = NULL,
+    shape = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "right"
+  )
+```
+Under the elections-only donor-pool specification, the software returns a donor-adjusted one-step-ahead volatility forecast that is above the no-donor baseline forecast but remains well below the observed next-day variance proxy. In this episode, the donor-adjusted variance forecast is approximately 0.000233, compared with a no-donor baseline forecast of about 0.000068 and an arithmetic-mean benchmark of about 0.000516, while the observed next-day variance proxy is about 0.001750. This indicates that, even under an elections-only donor pool, donor information still implies a positive short-horizon post-shock volatility uplift beyond the target-side pre-shock forecast. However, the magnitude of this uplift is limited, suggesting that same-type election donors alone may not be sufficient to generate a strong adjustment for the 2016 Election episode.
+
+## Comparison Across Donor-Pool Specifications
+
+To assess the role of donor-pool composition in the real-data experiment, we compare three analyst-specified donor-pool constructions for forecasting the one-step-ahead post-shock volatility following the 2016 Election. The first specification uses all available donor episodes in the candidate pool. The second specification uses a restricted donor pool consisting of three economically comparable events: the 2012 Election, Brexit Poll Released, and Brexit. The third specification uses an elections-only donor pool consisting of past U.S. presidential elections: the 2004 Election, 2008 Election, and 2012 Election. For each donor-pool choice, the software quickly returns the corresponding target-only baseline forecast (“unadjusted”), donor-adjusted forecast, and arithmetic-mean benchmark, allowing outputs across competing donor pools to be compared within a common framework. Because the true conditional variance is latent in real data, evaluation is based on the next-day squared return, which serves as an observed proxy for one-step-ahead variance.
+
+```{r comparison-table, echo=FALSE}
+library(kableExtra)
+
+obs_var_proxy <- Y_series_list[[1]][502]^2
+baseline_unadj <- svf_out_k1$predictions$unadjusted
+
+comparison_tbl <- data.frame(
+  spec = c("Restricted", "Elections only", "All donors"),
+  adj = c(
+    svf_out_k1$predictions$adjusted,
+    svf_out_elec$predictions$adjusted,
+    svf_out_all$predictions$adjusted
+  ),
+  mean = c(
+    svf_out_k1$predictions$arithmetic_mean,
+    svf_out_elec$predictions$arithmetic_mean,
+    svf_out_all$predictions$arithmetic_mean
+  )
+)
+
+comparison_tbl$ae_adj  <- abs(comparison_tbl$adj  - obs_var_proxy)
+comparison_tbl$ae_mean <- abs(comparison_tbl$mean - obs_var_proxy)
+
+knitr::kable(
+  comparison_tbl,
+  digits = 6,
+  booktabs = TRUE,
+  align = c("l", rep("c", 4)),
+  col.names = c(
+    "Specification",
+    "Adjusted",
+    "Arith. mean",
+    "AE Adj.",
+    "AE Mean"
+  ),
+  caption = "Comparison of donor-pool-specific one-step post-shock variance forecasts."
+) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    font_size = 9
+  )
+```
+
+```{r combined-comparison-figure, echo=FALSE, warning=FALSE, fig.width=9, fig.height=5}
+library(ggplot2)
+
+ep_panel <- episode_data_list[["2016 Election"]]$panel
+shock_idx <- episode_data_list[["2016 Election"]]$shock_index_in_panel
+forecast_idx <- shock_idx + 1
+
+hist_idx <- (forecast_idx - 30):forecast_idx
+
+hist_df <- data.frame(
+  day = 1:31,
+  value = abs(as.numeric(ep_panel[hist_idx, "ret_IYG"]))
+)
+
+compare_df <- data.frame(
+  day = c(31, 31.08, 31.16, 31.24, 31.32),
+  value = c(
+    abs(as.numeric(ep_panel[forecast_idx, "ret_IYG"])),
+    sqrt(svf_out_k1$predictions$unadjusted),
+    sqrt(svf_out_k1$predictions$adjusted),
+    sqrt(svf_out_elec$predictions$adjusted),
+    sqrt(svf_out_all$predictions$adjusted)
+  ),
+  type = factor(
+    c(
+      "Observed",
+      "Unadjusted",
+      "Adjusted (restricted)",
+      "Adjusted (elections only)",
+      "Adjusted (all donors)"
+    ),
+    levels = c(
+      "Observed",
+      "Unadjusted",
+      "Adjusted (restricted)",
+      "Adjusted (elections only)",
+      "Adjusted (all donors)"
+    )
+  )
+)
+
+ggplot() +
+  geom_line(data = hist_df, aes(day, value), color = "black", linewidth = 0.5) +
+  geom_point(data = hist_df, aes(day, value), color = "black", size = 2) +
+  geom_point(
+    data = compare_df,
+    aes(day, value, color = type, shape = type),
+    size = 3.5
+  ) +
+  scale_color_manual(values = c(
+    "Observed" = "black",
+    "Unadjusted" = "mediumpurple",
+    "Adjusted (restricted)" = "tomato",
+    "Adjusted (elections only)" = "steelblue4",
+    "Adjusted (all donors)" = "firebrick4"
+  )) +
+  scale_shape_manual(values = c(
+    "Observed" = 16,
+    "Unadjusted" = 18,
+    "Adjusted (restricted)" = 16,
+    "Adjusted (elections only)" = 17,
+    "Adjusted (all donors)" = 15
+  )) +
+  scale_x_continuous(
+    breaks = c(1, 10, 20, 30, 31),
+    labels = c("1", "10", "20", "30", "Forecast"),
+    limits = c(1, 31.45)
+  ) +
+  labs(
+    title = "IYG local volatility trend and forecast-day comparison",
+    x = "Day in local shock window",
+    y = "Volatility proxy scale",
+    color = NULL,
+    shape = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "right"
+  )
+
+```
+
+Taken together, these results suggest that donor-pool composition matters primarily through the magnitude of the implied post-shock volatility uplift rather than its direction. All three donor-pool specifications yield forecasts that are substantially above the no-donor baseline, indicating that donor information consistently contributes to short-horizon post-shock volatility forecasting. At the same time, the results also suggest that a broader donor pool is not automatically preferable, and that donor selection cannot rely on event-type similarity alone. The full donor pool may dilute the adjustment by incorporating less comparable episodes, while the elections-only pool shows that using only same-type historical events does not necessarily generate a strong donor correction. Overall, this case is more consistent with the view that donor selection should balance historical comparability, economic-environment similarity, and pre-shock feature similarity, rather than relying on any single criterion in isolation.
+
+In this sense, the software is useful not only because it quickly returns forecasts once a donor pool is specified, but also because it allows the analyst to evaluate how different substantive donor-pool choices affect the resulting uplift adjustment.
+
+```{r}
+
+episode_meta
+episode_data_list
+
+```
+
+```{r}
+# ============================================================
+# Build ready-to-use package data object: iyg_onestep_input
+# ============================================================
+# This chunk should be run after `episode_data_list` has been created.
+# Required columns in each episode panel:
+#   ret_IYG, ret_CLF, VIX_level, dIRX, dTNX
+# ============================================================
+
+make_iyg_svf_input <- function(target_event, donor_events, episode_data_list) {
+  
+  # ---- helper: extract outcome and covariates from one episode panel --------
+  extract_episode_inputs <- function(ep_obj) {
+    panel_i <- ep_obj$panel
+    
+    required_cols <- c("ret_IYG", "ret_CLF", "VIX_level", "dIRX", "dTNX")
+    missing_cols <- setdiff(required_cols, colnames(panel_i))
+    
+    if (length(missing_cols) > 0L) {
+      stop(
+        "Missing required columns in episode panel: ",
+        paste(missing_cols, collapse = ", ")
+      )
+    }
+    
+    Y_i <- as.numeric(panel_i[, "ret_IYG"])
+    
+    X_i <- data.frame(
+      ret_CLF   = as.numeric(panel_i[, "ret_CLF"]),
+      VIX_level = as.numeric(panel_i[, "VIX_level"]),
+      dIRX      = as.numeric(panel_i[, "dIRX"]),
+      dTNX      = as.numeric(panel_i[, "dTNX"])
+    )
+    
+    list(Y = Y_i, X = X_i)
+  }
+  
+  # ---- basic checks ---------------------------------------------------------
+  if (!target_event %in% names(episode_data_list)) {
+    stop("Target event not found in episode_data_list: ", target_event)
+  }
+  
+  missing_events <- setdiff(donor_events, names(episode_data_list))
+  if (length(missing_events) > 0L) {
+    stop(
+      "Donor events not found in episode_data_list: ",
+      paste(missing_events, collapse = ", ")
+    )
+  }
+  
+  # ---- target input ---------------------------------------------------------
+  target_obj <- extract_episode_inputs(episode_data_list[[target_event]])
+  
+  # ---- donor inputs ---------------------------------------------------------
+  donor_obj_list <- lapply(donor_events, function(nm) {
+    extract_episode_inputs(episode_data_list[[nm]])
+  })
+  names(donor_obj_list) <- donor_events
+  
+  # ---- assemble SynthVolForecast inputs ------------------------------------
+  Y_series_list <- c(
+    list(target_obj$Y),
+    lapply(donor_obj_list, function(x) x$Y)
+  )
+  names(Y_series_list) <- c(target_event, donor_events)
+  
+  covariates_series_list <- lapply(donor_obj_list, function(x) x$X)
+  names(covariates_series_list) <- donor_events
+  
+  target_covariates <- target_obj$X
+  
+  shock_time_vec <- rep(501L, length(Y_series_list))
+  shock_length_vec <- rep(1L, length(Y_series_list))
+  
+  list(
+    target_event = target_event,
+    donor_events = donor_events,
+    Y_series_list = Y_series_list,
+    covariates_series_list = covariates_series_list,
+    target_covariates = target_covariates,
+    shock_time_vec = shock_time_vec,
+    shock_length_vec = shock_length_vec
+  )
+}
+
+# ============================================================
+# Define target and donor-pool specifications
+# ============================================================
+
+target_event <- "2016 Election"
+
+donor_pool_specs <- list(
+  all = c(
+    "2004 Election",
+    "2008 Election",
+    "2012 Election",
+    "Brexit Announced",
+    "Brexit Poll Released",
+    "Brexit"
+  ),
+  
+  restricted = c(
+    "2012 Election",
+    "Brexit Poll Released",
+    "Brexit"
+  ),
+  
+  elections_only = c(
+    "2004 Election",
+    "2008 Election",
+    "2012 Election"
+  )
+)
+
+# ============================================================
+# Build three ready-to-use SynthVolForecast input objects
+# ============================================================
+
+iyg_all_input <- make_iyg_svf_input(
+  target_event = target_event,
+  donor_events = donor_pool_specs$all,
+  episode_data_list = episode_data_list
+)
+
+iyg_restricted_input <- make_iyg_svf_input(
+  target_event = target_event,
+  donor_events = donor_pool_specs$restricted,
+  episode_data_list = episode_data_list
+)
+
+iyg_elections_input <- make_iyg_svf_input(
+  target_event = target_event,
+  donor_events = donor_pool_specs$elections_only,
+  episode_data_list = episode_data_list
+)
+
+# ============================================================
+# Final package data object
+# ============================================================
+
+iyg_onestep_input <- list(
+  description = "Ready-to-use inputs for the IYG one-step post-shock volatility forecasting experiment.",
+  
+  target_symbol = "IYG",
+  target_event = target_event,
+  
+  inputs = list(
+    all = iyg_all_input,
+    restricted = iyg_restricted_input,
+    elections_only = iyg_elections_input
+  ),
+  
+  donor_pool_specs = donor_pool_specs,
+  
+  evaluation = list(
+    realized_variance_proxy = "next-day squared return",
+    forecast_horizon = 1L,
+    proxy_index = 502L
+  )
+)
+
+# ============================================================
+# Save as package data
+# ============================================================
+
+usethis::use_data(iyg_onestep_input, overwrite = TRUE)
+```
+
+```{r}
+devtools::load_all("..")
+
+data("iyg_onestep_input")
+
+names(iyg_onestep_input)
+names(iyg_onestep_input$inputs)
+
+names(iyg_onestep_input$inputs$restricted)
+iyg_onestep_input$inputs$restricted$donor_events
+
+# Check one ready-to-use input
+str(iyg_onestep_input$inputs$restricted, max.level = 1)
+
+
+```
+
+```{r}
+iyg_restricted <- iyg_onestep_input$inputs$restricted
+
+svf_out_restricted <- SynthVolForecast(
+  Y_series_list = iyg_restricted$Y_series_list,
+  covariates_series_list = iyg_restricted$covariates_series_list,
+  target_covariates = iyg_restricted$target_covariates,
+  shock_time_vec = iyg_restricted$shock_time_vec,
+  shock_length_vec = iyg_restricted$shock_length_vec,
+  k = 1,
+  dbw_indices = 1:ncol(iyg_restricted$target_covariates),
+  covariate_indices = NULL,
+  plots = FALSE,
+  return_fits = TRUE,
+  max.p = 3,
+  max.q = 3,
+  vcov.type = "robust"
+)
+
+svf_out_restricted$predictions
+
+```

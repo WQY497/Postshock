@@ -1,0 +1,1045 @@
+---
+title: "real-data_test"
+output: html_document
+---
+ 
+
+```{r}
+library("data.table")
+library("tidyverse")
+library("tseries")
+library("quantmod")
+library('Rsolnp')
+library('msos')
+library('tikzDevice')
+library('xtable')
+library(TSstudio)
+library(astsa)
+library(LSTS)
+
+############### dataset 
+
+################ Nike revenue #################################################################################
+
+
+nike<-read.csv("NKE_quarterly_valuation_measures.csv",header = TRUE)
+nike1<-nike[,-c(1,2)]
+A<-matrix(NA,nrow=ncol(nike1),ncol=3)
+for (i in 1:ncol(nike1)) {
+  A[i,1]<-colnames(nike1)[i]
+  A[i,2]<-nike1[2,i]
+  A[i,3]<-nike1[8,i]
+  
+}
+A<-as.data.frame(A)
+colnames(A)<-c("date","ev","ev.rev")
+A$ev.rev<-as.numeric(A$ev.rev)
+A$ev<-as.numeric(gsub(",","",A$ev))
+A$date<-gsub("X","",A$date)
+A$revenue<-A$ev/A$ev.rev
+b<-c()
+i=1
+for (i in 1:(nrow(A)-1)) {
+  b[i]<-((A[i,4]-A[i+1,4])*100/A[i+1,4])/100
+}
+b[nrow(A)]<-0
+A$per<-b
+A$per<-round(A$per,3)
+Nike.f<-A
+Nike.f<-Nike.f[1:which(Nike.f$date=="02.28.2001", arr.ind=TRUE),]
+
+################ Ecomical indices #################################################################################
+
+## S&P 500
+getSymbols('^GSPC', from = "2001-01-01")
+GSPC <- as.data.frame(GSPC)
+GSPC <- GSPC %>% mutate(Date = rownames(GSPC))
+
+## Gold Price
+getSymbols('GC=F', from = "2001-01-01")
+gold <- as.data.frame(`GC=F`)
+gold <- na.omit(gold)
+gold <- gold %>% mutate(Date = rownames(gold))
+
+## Dollar Index
+getSymbols('DX-Y.NYB', from = "2001-01-01")
+USD <- as.data.frame(`DX-Y.NYB`)
+USD <- na.omit(USD)
+USD <- USD %>% mutate(Date = rownames(USD))
+
+## 13-Week T-Bill
+#TB <- na.omit(TB)
+url <- "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DTB3" 
+tmp <- tempfile(fileext = ".csv") 
+download.file(url, tmp, method = "curl", extra = "-L") 
+DTB3 <- read.csv(tmp, stringsAsFactors = FALSE) 
+DTB3$observation_date <- as.Date(DTB3$observation_date) 
+DTB3$DTB3 <- as.numeric(DTB3$DTB3) 
+DTB3 <- na.omit(DTB3)
+TB <- data.frame(Date = DTB3$observation_date, Close = DTB3$DTB3)
+## Volatility Index
+getSymbols('^VIX', from = "2001-01-01")
+VIX <- as.data.frame(VIX)
+VIX <- na.omit(VIX)
+VIX <- VIX %>% mutate(Date = rownames(VIX))
+
+
+## inflation adjustment
+## inflation adjustment  —— replace FRED getSymbols with fredgraph.csv
+url <- "https://fred.stlouisfed.org/graph/fredgraph.csv?id=CPIAUCSL"
+tmp <- tempfile(fileext = ".csv")
+download.file(url, tmp, method = "curl", extra = "-L", quiet = TRUE)
+
+cpi <- read.csv(tmp, stringsAsFactors = FALSE)
+# 兼容列名（一般是 observation_date / CPIAUCSL）
+date_col <- if ("DATE" %in% names(cpi)) "DATE" else "observation_date"
+val_col  <- if ("CPIAUCSL" %in% names(cpi)) "CPIAUCSL" else "VALUE"
+
+cpi$DATE <- as.Date(cpi[[date_col]])
+cpi$CPI  <- as.numeric(cpi[[val_col]])
+cpi <- na.omit(cpi)
+
+library(xts)
+CPIAUCSL_xts <- xts(cpi$CPI, order.by = cpi$DATE)
+avg.cpi <- apply.yearly(CPIAUCSL_xts, mean)
+
+# 以 2020 年为基准
+inflation_adj <- data.frame(
+  dollars_2020 = as.numeric(avg.cpi["2020"]) / as.numeric(avg.cpi),
+  year = as.integer(format(index(avg.cpi), "%Y"))
+)
+
+
+# Data Preparation
+GSPC_close <- GSPC %>% dplyr::select(GSPC.Close, Date) %>% rename(GSPC_Close = GSPC.Close)
+USD_close <- USD %>% dplyr::select(`DX-Y.NYB.Close`, Date) %>% rename(USD_Close = `DX-Y.NYB.Close`)
+TB_close <- TB %>% dplyr::select(Close, Date) %>% rename(TB_Close = Close)
+VIX_close <- VIX %>% dplyr::select(VIX.Close, Date) %>% rename(VIX_Close = VIX.Close)
+Gold<-gold
+colnames(Gold)<-c("gold.Open","gold.High","gold.Low","gold.Close","gold.Volume","gold.Adjusted","Date")
+Gold_close <- Gold %>% dplyr::select(gold.Close, Date) %>% rename(gold_Close = gold.Close)
+
+GSPC_close[GSPC_close$Date=="05.31.2021",]
+
+GSPC_close1<-GSPC_close
+tom <- list( Gold_close, USD_close, TB_close, VIX_close)
+for (i in 1:length(tom)) {
+  GSPC_close1 <- merge(GSPC_close1, tom[[i]])
+}
+
+Ot.In<-GSPC_close1
+Ot.In<-as.data.frame(t(rev(as.data.frame(t(Ot.In)))))
+Ot.In$GSPC_Close<-as.numeric(Ot.In$GSPC_Close)
+Ot.In$gold_Close<-as.numeric(Ot.In$gold_Close)
+Ot.In$USD_Close<-as.numeric(Ot.In$USD_Close)
+Ot.In$TB_Close<-as.numeric(Ot.In$TB_Close)
+Ot.In$VIX_Close<-as.numeric(Ot.In$VIX_Close)
+
+
+################ Problem with quarters of ecenomical indeces ################################################################
+
+#Now Nike dataset contains quarterly revenue data where each quarter closes at the same date of every year. 
+#On the other hand, the econ indexes are stock indexes and the stock market isn't always open. 
+#That means that if the quarter closes on 31/03/2024 and  this day is a holiday at that year, 
+#then the quarter will close on 04/01/2024. This situation is the reason why when we combined 
+#the 2 datasets we had some quarters "missing". So, we change the quarters of the econometric indexes 
+#to match the ones of Nike.
+
+q.seq<-Nike.f$date
+Ot.In$Date<-gsub("-","/",Ot.In$Date)
+Ot.In$Date<-format(as.Date(Ot.In$Date, '%Y/%m/%d'), '%m/%d/%Y')
+Ot.In$Date<-gsub("/",".",Ot.In$Date)
+
+#Ot.In[(q.seq %in% Ot.In$Date)==TRUE,] 
+q.seq %in% Ot.In$Date #we are missing some quarters
+sum((q.seq %in% Ot.In$Date)==FALSE)
+length(q.seq)
+b<-c()
+i=1
+for (i in 1:length(q.seq)) {
+  if((q.seq %in% Ot.In$Date)[i]==TRUE){
+    b[i]<-which(Ot.In$Date==q.seq[i], arr.ind=TRUE)
+  }else{
+    a<-q.seq[i]
+    flag=F
+    a<-as.Date(a, '%m.%d.%Y')-1
+    a<-gsub("-","/",a)
+    a<-format(as.Date(a, '%Y/%m/%d'), '%m/%d/%Y')
+    a<-gsub("/",".",a)
+    while(flag==FALSE){
+      if(nrow(Ot.In[Ot.In$Date==a,])!=0){
+        b[i]<-which(Ot.In$Date==a, arr.ind=TRUE)
+        flag=TRUE
+      }else{
+        a<-as.Date(a, '%m.%d.%Y')-1
+        a<-gsub("-","/",a)
+        a<-format(as.Date(a, '%Y/%m/%d'), '%m/%d/%Y')
+        a<-gsub("/",".",a)
+      }
+    }
+  }
+}
+
+Ot.In1<-Ot.In[b,] # it should contain 4 dates for each month
+#if we exclude the first quarter of 2024, we have 92 dates in total which mean 23 years in total
+
+#check that Ot.In1 contains 4 dates for each month
+
+for (i in 1:length(Nike.f$date)) {
+  if(Nike.f$date[i]!=Ot.In1$Date[i]){
+    n.date<-gsub(r"(\.)", "/", Nike.f$date[i])
+    n.date<-format(as.Date(n.date, '%m/%d/%Y'), '%Y/%m/%d')
+    n.date<-gsub("/", "", n.date)
+    n.date<-as.numeric(n.date)
+    o.date<-gsub(r"(\.)", "/",Ot.In1$Date[i])
+    o.date<-format(as.Date(o.date, '%m/%d/%Y'), '%Y/%m/%d')
+    o.date<-gsub("/", "", o.date)
+    o.date<-as.numeric(o.date)
+    if(n.date%/%100==o.date%/%100){
+      Ot.In1[i,1]<-Nike.f[i,1]
+    }else{
+      print("wrong dates")
+    }
+  }
+}
+all.equal(Nike.f$date,Ot.In1$Date)
+
+
+################ combine the datasets and calculate percentage change in values ####################################
+
+A<-Ot.In1
+b<-matrix(NA,nrow = nrow(A),ncol=ncol(A)-1)
+for (j in 1:ncol(b)) {
+  for (i in 1:(nrow(A)-1)) {
+    b[i,j]<-((A[i,j+1]-A[i+1,j+1])*100/A[i+1,j+1])/100
+  }
+}
+b[nrow(A),]<-0
+Ot.In1$GSPC_Close.per<-round(b[,1],3)
+Ot.In1$gold_Close.per<-round(b[,2],3)
+Ot.In1$USD_Close.per<-round(b[,3],3)
+Ot.In1$TB_Close.per<-round(b[,4],3)
+Ot.In1$VIX_Close.per<-round(b[,5],3)
+
+Nike.fff<-data.frame(date=Nike.f$date,Nike.per=Nike.f$per,
+                     GSPC.x=Ot.In1$GSPC_Close.per,gold.x=Ot.In1$gold_Close.per,USD.x=Ot.In1$USD_Close.per,
+                     TB.x=Ot.In1$TB_Close.per,VIX.x=Ot.In1$VIX_Close.per)
+
+Y <- Nike.fff$Nike.per
+
+# data frame
+Nike.fff <- data.frame(Nike.fff[-1, ], Y[-length(Y)])
+colnames(Nike.fff)[ncol(Nike.fff)]<-"Y"
+Nike.final<-as.data.frame(Nike.fff)
+rownames(Nike.final)<-as.character(1:nrow(Nike.final))
+head(Nike.final)
+
+
+################ model fitting #################################################################################
+
+Nike.final<-Nike.final[ ,-9]
+start <- which(Nike.final$date == "11.30.2013")
+start_day_30112013 <- as.numeric(1:nrow(Nike.final) == start)
+Nike.final$start_day_30112013<-start_day_30112013
+x<-Nike.final
+x$date<-as.Date(x$date,'%m.%d.%Y')
+x<-x[which(x$date=="2013-11-30"):which(x$date=="2009-11-30"),] 
+
+for (i in 1:length(as.numeric(gsub("-","",x$date))%/%10000)) {
+  x[i, 2:8] <- x[i, 2:8] * inflation_adj$dollars_2020[inflation_adj$year == (as.numeric(gsub("-","",x$date))%/%10000)[i]] 
+}
+
+ts.data<-read.zoo(x)
+ts.fit<-xts(x,order.by=x$date)
+
+#model.ts1<-sarima(as.numeric(ts.fit$Y),0,1,0,2,1,0,4, # AIC = -7.247772  # 0.0761 # roots equal to 1 // 
+#                  xreg=ts.fit[,c(3,9)],details=FALSE) #this means the process has persistent oscillations,  
+#often seen in economic and  financial time series
+
+
+#model.ts1<-sarima(as.numeric(ts.fit$Y),0,0,0,2,1,0,4, # AIC = -2.845041  # 0.0668  
+#                  xreg=ts.fit[,c(3,4,9)],details=FALSE)
+
+model.ts1<-sarima(as.numeric(ts.fit$Y),0,1,1,2,1,0,4, # AIC = -8.336005  # 0.1074 # roots equal to 1 // 
+                  xreg=ts.fit[,c(6,9)],details=FALSE)
+
+
+#model.ts1<-sarima(as.numeric(ts.fit$Y),2,1,0,1,1,0,4, # AIC = -7.247772  # 0.0761 # roots equal to 1 // 
+#                  xreg=ts.fit[,c(3,5,9)],details=FALSE)
+
+
+#model.ts1<-sarima(as.numeric(ts.fit$Y),1,1,1,1,1,0,4, # AIC = -2.217827  # 0.1265 
+#                  xreg=ts.fit[,c(3,5,9)],details=FALSE)
+
+#model.ts1<-sarima(as.numeric(ts.fit$Y),3,1,0,1,1,0,4, # AIC = -3.129856  # -0.1179 # sar1 almost equal to 1
+#                  xreg=ts.fit[,c(3,5,9)],details=FALSE)
+
+#model.ts1<-sarima(as.numeric(ts.fit$Y),1,0,0,1,1,0,4, # AIC = -2.831387  # 0.1377
+#                  xreg=ts.fit[,c(3,5,9)],details=FALSE)
+
+
+
+## Diagnostics
+Box.test(model.ts1$fit$residuals,lag=10,type = "Ljung-Box")
+Box.Ljung.Test(model.ts1$fit$residuals, lag = 10, main = "Ljung-Box Test P-Values")
+acf(model.ts1$fit$residuals)
+pacf(model.ts1$fit$residuals)
+plot(model.ts1$fit$residuals)
+
+
+Kanye.effect<-model.ts1$ttable[5,1:2]
+Kanye.effect
+
+
+```
+
+```{r}
+## ========= Build dataset for SynthPrediction (Target = Revenue) =========
+
+# 1) Nike nominal revenue -> deflate to 2020 USD -> take log
+nike_rev <- data.frame(
+  Date    = as.Date(gsub("\\.", "-", Nike.f$date), format = "%m-%d-%Y"),
+  Revenue = Nike.f$revenue
+)
+# Keep data from 2001-02-28 onward
+nike_rev <- nike_rev[nike_rev$Date >= as.Date("2001-02-28"), ]
+# Extract calendar year for joining with the inflation table
+nike_rev$year <- as.integer(format(nike_rev$Date, "%Y"))
+# Join CPI/deflator to convert nominal revenue to 2020 USD
+nike_rev <- merge(nike_rev, inflation_adj, by = "year", all.x = TRUE)
+# Real revenue (2020 USD) and its log
+nike_rev$Revenue_2020USD <- nike_rev$Revenue * nike_rev$dollars_2020
+nike_rev$Y_logRev2020    <- log(nike_rev$Revenue_2020USD)
+
+# 2) Covariates: pre-computed QoQ (quarter-over-quarter) changes for 5 factors
+X_qoq <- data.frame(
+  Date = as.Date(gsub("\\.", "-", Ot.In1$Date), format = "%m-%d-%Y"),
+  GSPC = Ot.In1$GSPC_Close.per,
+  GOLD = Ot.In1$gold_Close.per,
+  USD  = Ot.In1$USD_Close.per,
+  TB   = Ot.In1$TB_Close.per,
+  VIX  = Ot.In1$VIX_Close.per
+)
+
+# 3) Merge target and covariates by quarter, sort ascending, drop missing
+df_syn <- merge(
+  nike_rev[, c("Date","Y_logRev2020","Revenue","Revenue_2020USD")],
+  X_qoq, by = "Date", all = FALSE
+)
+df_syn <- df_syn[order(df_syn$Date), ]
+df_syn <- na.omit(df_syn)
+
+# 4) Export a clean CSV (keep both nominal and real revenue for reference)
+write.csv(
+  df_syn[, c("Date","Y_logRev2020","GSPC","GOLD","USD","TB","VIX",
+             "Revenue","Revenue_2020USD")],
+  "nike_for_synthprediction.csv", row.names = FALSE
+)
+
+# 5) Build ts objects required by SynthPrediction (model uses ts/xts; plotting uses original dates)
+#    Compute ts start as (year, quarter) inferred from the first date
+q_start <- c(
+  as.integer(format(df_syn$Date[1], "%Y")),
+  c(1,2,3,4)[cut(as.integer(format(df_syn$Date[1], "%m")),
+                 breaks = c(0,3,6,9,12), labels = FALSE)]
+)
+
+# Target series (log real revenue, quarterly)
+Y_series_list <- list(
+  NKE = ts(df_syn$Y_logRev2020, frequency = 4, start = q_start)
+)
+# Covariate matrix as ts (same frequency and start)
+covariates_series_list <- list(
+  NKE = ts(as.matrix(df_syn[, c("GSPC","GOLD","USD","TB","VIX")]),
+           frequency = 4, start = q_start)
+)
+
+# Quick sanity printouts
+Y_series_list$NKE
+covariates_series_list$NKE
+
+
+## ========= Plot using actual date axis (not the ts quarterly index) =========
+library(ggplot2)
+
+p1 <- ggplot(df_syn, aes(Date, Y_logRev2020)) +
+  geom_line() +
+  labs(title = "Nike log revenue (2020 USD)",
+       y = "log(Revenue_2020USD)", x = "Date")
+print(p1)
+
+
+## ========= Auto-detect the quarter with the largest single-quarter drop =========
+# Compute log differences on the date-aligned data.frame (quarterly steps)
+dY <- diff(df_syn$Y_logRev2020)
+i_min <- which.min(dY)                 # the drop occurs at row (i_min + 1)
+shock_date_auto <- df_syn$Date[i_min + 1]
+drop <- dY[i_min]
+
+cat("Auto-detected shock date:", format(shock_date_auto),
+    " | log drop =", round(drop, 6), "\n")
+
+# Visualize the detected shock date on the log-revenue series
+p2 <- ggplot(df_syn, aes(Date, Y_logRev2020)) +
+  geom_line() +
+  geom_vline(xintercept = shock_date_auto, linetype = "dashed", color = "red") +
+  annotate("text", x = shock_date_auto, 
+           y = min(df_syn$Y_logRev2020, na.rm = TRUE),
+           vjust = -0.5, label = format(shock_date_auto), color = "red") +
+  labs(title = "Max single-quarter drop (auto-detected)",
+       y = "log(Revenue_2020USD)", x = "Date")
+print(p2)
+
+```
+
+```{r}
+################ Datasets of Adidas, Puma & Under Armour ######
+################### ADIDAS
+adidas<-read.csv("ADDDF_quarterly_valuation_measures.csv",header = TRUE)
+adidas1<-adidas[,-c(1,2)]
+A<-matrix(NA,nrow=ncol(adidas1),ncol=3)
+for (i in 1:ncol(adidas1)) {
+  A[i,1]<-colnames(adidas1)[i]
+  A[i,2]<-adidas1[2,i]
+  A[i,3]<-adidas1[8,i]
+  
+}
+A<-as.data.frame(A)
+colnames(A)<-c("date","ev","ev.rev")
+A$ev.rev<-as.numeric(A$ev.rev)
+A$ev<-as.numeric(gsub(",","",A$ev))
+A$date<-gsub("X","",A$date)
+A$revenue<-A$ev/A$ev.rev
+b<-c()
+for (i in 1:(nrow(A)-1)) {
+  b[i]<-((A[i,4]-A[i+1,4])*100/A[i+1,4])/100
+}
+b[nrow(A)]<-0
+A$per<-b
+A$per<-round(A$per,3)
+Adidas.f<-A
+
+################### PUMA
+
+puma<-read.csv("PMMAF_quarterly_valuation_measures.csv",header = TRUE)
+puma1<-puma[,-c(1,2)]
+A<-matrix(NA,nrow=ncol(puma1),ncol=3)
+for (i in 1:ncol(puma1)) {
+  A[i,1]<-colnames(puma1)[i]
+  A[i,2]<-puma1[2,i]
+  A[i,3]<-puma1[8,i]
+  
+}
+A<-as.data.frame(A)
+colnames(A)<-c("date","ev","ev.rev")
+A$ev.rev<-as.numeric(A$ev.rev)
+A$ev<-as.numeric(gsub(",","",A$ev))
+A$date<-gsub("X","",A$date)
+A$revenue<-A$ev/A$ev.rev
+b<-c()
+for (i in 1:(nrow(A)-1)) {
+  b[i]<-((A[i,4]-A[i+1,4])*100/A[i+1,4])/100
+}
+b[nrow(A)]<-0
+A$per<-b
+A$per<-round(A$per,3)
+
+puma.f<-A
+
+################### UNDER ARMOUR
+
+ua<-read.csv("UAA_quarterly_valuation_measures.csv",header = TRUE)
+ua1<-ua[,-c(1,2)]
+A<-matrix(NA,nrow=ncol(ua1),ncol=3)
+for (i in 1:ncol(ua1)) {
+  A[i,1]<-colnames(ua1)[i]
+  A[i,2]<-ua1[2,i]
+  A[i,3]<-ua1[8,i]
+  
+}
+A<-as.data.frame(A)
+colnames(A)<-c("date","ev","ev.rev")
+A$ev.rev<-as.numeric(A$ev.rev)
+A$ev<-as.numeric(gsub(",","",A$ev))
+A$date<-gsub("X","",A$date)
+A$revenue<-A$ev/A$ev.rev
+b<-c()
+for (i in 1:(nrow(A)-1)) {
+  b[i]<-((A[i,4]-A[i+1,4])*100/A[i+1,4])/100
+}
+b[nrow(A)]<-0
+A$per<-b
+A$per<-round(A$per,3)
+ua.f<-A
+
+######### Econ Indices ####################
+head(Adidas.f)
+tail(Adidas.f)
+head(Ot.In) ## 1st quarter 6.30.2010
+tail(Ot.In) ## last quarter 3.31.2024 ### # from 01/2001 and on => we choose 6.30.2010 quarter for Adidas and on 
+Adidas.f<-Adidas.f[1:which(Adidas.f$date=="06.30.2010", arr.ind=TRUE),]
+q.seq<-Adidas.f$date
+
+q.seq %in% Ot.In$Date #we are missing 17 quarters
+sum((q.seq %in% Ot.In$Date)==FALSE)
+length(q.seq)
+b<-c()
+for (i in 1:length(q.seq)) {
+  if((q.seq %in% Ot.In$Date)[i]==TRUE){
+    b[i]<-which(Ot.In$Date==q.seq[i], arr.ind=TRUE)
+  }else{
+    a<-q.seq[i]
+    flag=F
+    a<-as.Date(a, '%m.%d.%Y')-1
+    a<-gsub("-","/",a)
+    a<-format(as.Date(a, '%Y/%m/%d'), '%m/%d/%Y')
+    a<-gsub("/",".",a)
+    while(flag==FALSE){
+      if(nrow(Ot.In[Ot.In$Date==a,])!=0){
+        b[i]<-which(Ot.In$Date==a, arr.ind=TRUE)
+        flag=TRUE
+      }else{
+        a<-as.Date(a, '%m.%d.%Y')-1
+        a<-gsub("-","/",a)
+        a<-format(as.Date(a, '%Y/%m/%d'), '%m/%d/%Y')
+        a<-gsub("/",".",a)
+      }
+    }
+  }
+}
+
+Ot.In2<-Ot.In[b,] # it should contain 4 dates for each month
+#if we exclude the first quarter of 2024, we have 92 dates in total which mean 23 years in total
+
+#check that Ot.In2 contains 4 dates for each month
+
+for (i in 1:length(Adidas.f$date)) {
+  if(Adidas.f$date[i]!=Ot.In2$Date[i]){
+    n.date<-gsub(r"(\.)", "/", Adidas.f$date[i])
+    n.date<-format(as.Date(n.date, '%m/%d/%Y'), '%Y/%m/%d')
+    n.date<-gsub("/", "", n.date)
+    n.date<-as.numeric(n.date)
+    o.date<-gsub(r"(\.)", "/",Ot.In2$Date[i])
+    o.date<-format(as.Date(o.date, '%m/%d/%Y'), '%Y/%m/%d')
+    o.date<-gsub("/", "", o.date)
+    o.date<-as.numeric(o.date)
+    if(n.date%/%100==o.date%/%100){
+      Ot.In2[i,1]<-Adidas.f[i,1]
+    }else{
+      print("wrong dates")
+    }
+  }
+}
+all.equal(Adidas.f$date,Ot.In2$Date)
+
+#calculate percentage increase or decrease
+A<-Ot.In2
+b<-matrix(NA,nrow = nrow(A),ncol=ncol(A)-1)
+for (j in 1:ncol(b)) {
+  for (i in 1:(nrow(A)-1)) {
+    b[i,j]<-((A[i,j+1]-A[i+1,j+1])*100/A[i+1,j+1])/100
+  }
+}
+b[nrow(A),]<-0
+Ot.In2$GSPC_Close.per<-round(b[,1],3)
+Ot.In2$gold_Close.per<-round(b[,2],3)
+Ot.In2$USD_Close.per<-round(b[,3],3)
+Ot.In2$TB_Close.per<-round(b[,4],3)
+Ot.In2$VIX_Close.per<-round(b[,5],3)
+
+
+Adidas.fff<-data.frame(date=Adidas.f$date,Adidas.per=Adidas.f$per,
+                       GSPC.x=Ot.In2$GSPC_Close.per,gold.x=Ot.In2$gold_Close.per,USD.x=Ot.In2$USD_Close.per,
+                       TB.x=Ot.In2$TB_Close.per,VIX.x=Ot.In2$VIX_Close.per)
+
+Y <- Adidas.fff$Adidas.per
+
+# data frame
+Adidas.fff <- data.frame(Adidas.fff[-1, ], Y[-length(Y)])
+colnames(Adidas.fff)[ncol(Adidas.fff)]<-"Y"
+Adidas.final<-as.data.frame(Adidas.fff)
+rownames(Adidas.final)<-as.character(1:nrow(Adidas.final))
+head(Adidas.final)
+
+## set quarters for Puma
+
+head(puma.f) ## 1st quarter 09.30.2009 but we won't use dates earlier than 2014 anyway so we stick with 6.30.2010
+tail(puma.f) ## last quarter 12.31.2023 ####  => we choose 6.30.2010 quarter for Adidas and on 
+
+puma.f<-puma.f[1:which(puma.f$date=="06.30.2010", arr.ind=TRUE),]
+q.seq<-puma.f$date
+
+q.seq %in% Ot.In$Date #we are missing 13 quarters
+sum((q.seq %in% Ot.In$Date)==FALSE)
+length(q.seq)
+b<-c()
+for (i in 1:length(q.seq)) {
+  if((q.seq %in% Ot.In$Date)[i]==TRUE){
+    b[i]<-which(Ot.In$Date==q.seq[i], arr.ind=TRUE)
+  }else{
+    a<-q.seq[i]
+    flag=F
+    a<-as.Date(a, '%m.%d.%Y')-1
+    a<-gsub("-","/",a)
+    a<-format(as.Date(a, '%Y/%m/%d'), '%m/%d/%Y')
+    a<-gsub("/",".",a)
+    while(flag==FALSE){
+      if(nrow(Ot.In[Ot.In$Date==a,])!=0){
+        b[i]<-which(Ot.In$Date==a, arr.ind=TRUE)
+        flag=TRUE
+      }else{
+        a<-as.Date(a, '%m.%d.%Y')-1
+        a<-gsub("-","/",a)
+        a<-format(as.Date(a, '%Y/%m/%d'), '%m/%d/%Y')
+        a<-gsub("/",".",a)
+      }
+    }
+  }
+}
+
+Ot.In3<-Ot.In[b,] # it should contain 4 dates for each month
+#if we exclude the first quarter of 2024, we have 92 dates in total which mean 23 years in total
+
+#check that Ot.In3 contains 4 dates for each month
+
+for (i in 1:length(puma.f$date)) {
+  if(puma.f$date[i]!=Ot.In3$Date[i]){
+    n.date<-gsub(r"(\.)", "/", puma.f$date[i])
+    n.date<-format(as.Date(n.date, '%m/%d/%Y'), '%Y/%m/%d')
+    n.date<-gsub("/", "", n.date)
+    n.date<-as.numeric(n.date)
+    o.date<-gsub(r"(\.)", "/",Ot.In3$Date[i])
+    o.date<-format(as.Date(o.date, '%m/%d/%Y'), '%Y/%m/%d')
+    o.date<-gsub("/", "", o.date)
+    o.date<-as.numeric(o.date)
+    if(n.date%/%100==o.date%/%100){
+      Ot.In3[i,1]<-puma.f[i,1]
+    }else{
+      print("wrong dates")
+    }
+  }
+}
+all.equal(puma.f$date,Ot.In3$Date)
+
+#calculate percentage increase or decrease
+A<-Ot.In3
+b<-matrix(NA,nrow = nrow(A),ncol=ncol(A)-1)
+for (j in 1:ncol(b)) {
+  for (i in 1:(nrow(A)-1)) {
+    b[i,j]<-((A[i,j+1]-A[i+1,j+1])*100/A[i+1,j+1])/100
+  }
+}
+b[nrow(A),]<-0
+Ot.In3$GSPC_Close.per<-round(b[,1],3)
+Ot.In3$gold_Close.per<-round(b[,2],3)
+Ot.In3$USD_Close.per<-round(b[,3],3)
+Ot.In3$TB_Close.per<-round(b[,4],3)
+Ot.In3$VIX_Close.per<-round(b[,5],3)
+
+puma.fff<-data.frame(date=puma.f$date,Puma.per=puma.f$per,
+                     GSPC.x=Ot.In3$GSPC_Close.per,gold.x=Ot.In3$gold_Close.per,USD.x=Ot.In3$USD_Close.per,
+                     TB.x=Ot.In3$TB_Close.per,VIX.x=Ot.In3$VIX_Close.per)
+
+Y <- puma.fff$Puma.per
+
+# data frame
+puma.fff <- data.frame(puma.fff[-1, ], Y[-length(Y)])
+colnames(puma.fff)[ncol(puma.fff)]<-"Y"
+Puma.final<-as.data.frame(puma.fff)
+rownames(Puma.final)<-as.character(1:nrow(Puma.final))
+head(Puma.final)
+
+
+
+## set quarters for UA
+
+head(ua.f) ## 1st quarter 12.31.2005 but we won't use dates earlier than 2014 anyway so we stick with 6.30.2010
+tail(ua.f) ## last quarter 12.31.2023 ###  => we choose 6.30.2010 quarter for Adidas and on
+
+ua.f<-ua.f[1:which(ua.f$date=="06.30.2010", arr.ind=TRUE),]
+q.seq<-ua.f$date
+
+q.seq %in% Ot.In$Date #we are missing 17 quarters
+sum((q.seq %in% Ot.In$Date)==FALSE)
+length(q.seq)
+b<-c()
+for (i in 1:length(q.seq)) {
+  if((q.seq %in% Ot.In$Date)[i]==TRUE){
+    b[i]<-which(Ot.In$Date==q.seq[i], arr.ind=TRUE)
+  }else{
+    a<-q.seq[i]
+    flag=F
+    a<-as.Date(a, '%m.%d.%Y')-1
+    a<-gsub("-","/",a)
+    a<-format(as.Date(a, '%Y/%m/%d'), '%m/%d/%Y')
+    a<-gsub("/",".",a)
+    while(flag==FALSE){
+      if(nrow(Ot.In[Ot.In$Date==a,])!=0){
+        b[i]<-which(Ot.In$Date==a, arr.ind=TRUE)
+        flag=TRUE
+      }else{
+        a<-as.Date(a, '%m.%d.%Y')-1
+        a<-gsub("-","/",a)
+        a<-format(as.Date(a, '%Y/%m/%d'), '%m/%d/%Y')
+        a<-gsub("/",".",a)
+      }
+    }
+  }
+}
+
+
+Ot.In4<-Ot.In[b,] # it should contain 4 dates for each month
+#if we exclude the first quarter of 2024, we have 92 dates in total which mean 23 years in total
+
+#check that Ot.In2 contains 4 dates for each month
+
+for (i in 1:length(ua.f$date)) {
+  if(ua.f$date[i]!=Ot.In4$Date[i]){
+    n.date<-gsub(r"(\.)", "/", ua.f$date[i])
+    n.date<-format(as.Date(n.date, '%m/%d/%Y'), '%Y/%m/%d')
+    n.date<-gsub("/", "", n.date)
+    n.date<-as.numeric(n.date)
+    o.date<-gsub(r"(\.)", "/",Ot.In4$Date[i])
+    o.date<-format(as.Date(o.date, '%m/%d/%Y'), '%Y/%m/%d')
+    o.date<-gsub("/", "", o.date)
+    o.date<-as.numeric(o.date)
+    if(n.date%/%100==o.date%/%100){
+      Ot.In4[i,1]<-ua.f[i,1]
+    }else{
+      print("wrong dates")
+    }
+  }
+}
+all.equal(ua.f$date,Ot.In4$Date)
+
+#calculate percentage increase or decrease
+A<-Ot.In4
+b<-matrix(NA,nrow = nrow(A),ncol=ncol(A)-1)
+for (j in 1:ncol(b)) {
+  for (i in 1:(nrow(A)-1)) {
+    b[i,j]<-((A[i,j+1]-A[i+1,j+1])*100/A[i+1,j+1])/100
+  }
+}
+b[nrow(A),]<-0
+Ot.In4$GSPC_Close.per<-round(b[,1],3)
+Ot.In4$gold_Close.per<-round(b[,2],3)
+Ot.In4$USD_Close.per<-round(b[,3],3)
+Ot.In4$TB_Close.per<-round(b[,4],3)
+Ot.In4$VIX_Close.per<-round(b[,5],3)
+
+Ua.fff<-data.frame(date=ua.f$date,Ua.per=ua.f$per,
+                   GSPC.x=Ot.In4$GSPC_Close.per,gold.x=Ot.In4$gold_Close.per,USD.x=Ot.In4$USD_Close.per,
+                   TB.x=Ot.In4$TB_Close.per,VIX.x=Ot.In4$VIX_Close.per)
+
+Y <- Ua.fff$Ua.per
+
+# data frame
+Ua.fff <- data.frame(Ua.fff[-1, ], Y[-length(Y)])
+colnames(Ua.fff)[ncol(Ua.fff)]<-"Y"
+Ua.final<-as.data.frame(Ua.fff)
+rownames(Ua.final)<-as.character(1:nrow(Ua.final))
+head(Ua.final)
+
+
+####### Final Datsets ####### 
+
+head(Adidas.final)
+head(Puma.final)
+head(Ua.final)
+```
+
+```{r}
+library(dplyr)
+
+# Build a clean donor Y dataframe for one brand:
+# - Parse dates
+# - Convert nominal revenue to 2020 USD using an inflation table
+# - Take log of real revenue
+# - Save to CSV and return the data.frame (Date, nominal, real, log-real)
+build_donor_Y <- function(brand_f, csv_name, inflation_adj){
+  out <- brand_f %>%
+    # Normalize date format and keep revenue as numeric
+    transmute(
+      Date    = as.Date(gsub("\\.", "-", date), "%m-%d-%Y"),
+      Revenue = as.numeric(revenue)
+    ) %>%
+    arrange(Date) %>%
+    # Extract year for joining the inflation adjustment table
+    mutate(year = as.integer(format(Date, "%Y"))) %>%
+    left_join(inflation_adj, by = "year") %>%
+    # Real revenue in 2020 USD and its log
+    mutate(
+      Revenue_2020USD = Revenue * dollars_2020,
+      Y_logRev2020    = log(Revenue_2020USD)
+    ) %>%
+    # Keep tidy columns for downstream use
+    select(Date, Revenue, Revenue_2020USD, Y_logRev2020)
+  
+  # Persist a CSV for audit/reuse
+  write.csv(out, csv_name, row.names = FALSE)
+  out
+}
+
+# Donors: produce Y-only datasets (covariates can be merged later)
+Adidas_donor <- build_donor_Y(Adidas.f, "donor_adidas_Y.csv", inflation_adj)
+Puma_donor   <- build_donor_Y(puma.f,   "donor_puma_Y.csv",   inflation_adj)
+UA_donor     <- build_donor_Y(ua.f,     "donor_ua_Y.csv",     inflation_adj)
+
+# Helper: convert a donor data.frame to a quarterly ts object for SynthPrediction
+# - Infers (year, quarter) start from the first date
+# - Uses frequency = 4 (quarterly)
+mk_ts <- function(df){
+  q_start <- c(
+    as.integer(format(df$Date[1], "%Y")),
+    c(1,2,3,4)[cut(
+      as.integer(format(df$Date[1], "%m")),
+      breaks = c(0,3,6,9,12),
+      labels = FALSE
+    )]
+  )
+  ts(df$Y_logRev2020, frequency = 4, start = q_start)
+}
+
+# Assemble donor list (named), each entry is a quarterly ts of log real revenue
+Y_donors_list <- list(
+  ADIDAS = mk_ts(Adidas_donor),
+  PUMA   = mk_ts(Puma_donor),
+  UA     = mk_ts(UA_donor)
+)
+
+# Quick glance (optional)
+Y_donors_list
+
+```
+
+```{r}
+library(zoo)
+
+# 想要的区间：2010Q2 —— 2022Q1
+start_q <- as.yearqtr("2010 Q2")
+end_q   <- as.yearqtr("2022 Q1")
+
+library(zoo)
+Y_series_list <- lapply(Y_series_list, function(x)
+  window(as.zoo(x), start = as.yearqtr("2010 Q2"), end = as.yearqtr("2022 Q1")))
+Y_donors_list <- lapply(Y_donors_list, function(x)
+  window(as.zoo(x), start = as.yearqtr("2010 Q2"), end = as.yearqtr("2022 Q1")))
+
+Y_series_list
+Y_donors_list
+```
+
+```{r}
+# Your code has already time-aligned these two lists:
+# Y_series_list <- lapply(...)
+# Y_donors_list <- lapply(...)
+
+# 1.1 Merge target and donor series into a single list
+Y_all_aligned <- c(Y_series_list, Y_donors_list)
+
+# 1.2 (Optional but recommended) Name each entry for easier debugging
+names(Y_all_aligned) <- c("NKE_Y", "ADIDAS_Y", "PUMA_Y", "UA_Y")
+
+# 1.3 Quick sanity checks
+cat("--- Target and Donor (Y) list ---\n")
+cat("Total list length:", length(Y_all_aligned), "\n")  # should print 4
+print(names(Y_all_aligned))
+
+# Peek at the first few observations for the first two series
+# (expect Nike 2010 Q2 for [[1]], Adidas 2010 Q2 for [[2]] if that’s your start)
+print(head(Y_all_aligned[[1]]))
+print(head(Y_all_aligned[[2]]))
+
+
+```
+```{r}
+devtools::load_all(".")
+library(postshock)
+# 5. Run SynthPrediction (enable seasonality and bypass auto.arima)
+# 4. Prepare shock parameters (must run BEFORE calling the function)
+shock_date_str <- "2020 Q2"
+shock_date_qtr <- as.yearqtr(shock_date_str)
+
+# Ensure Y_all_aligned already exists (list of aligned quarterly ts/xts)
+all_dates <- time(Y_all_aligned[[1]])
+# We want to predict the first post-shock quarter, so set shock index to Q2
+# and use k = 1 to forecast Q3 if that’s your convention; here we follow your setup.
+shock_index_int <- which(all_dates == shock_date_qtr) - 1
+
+n_series <- length(Y_all_aligned)
+
+# --- Missing in your previous script: construct per-series shock inputs ---
+shock_time_vector   <- rep(shock_index_int, n_series)  # same shock index for all series
+shock_length_vector <- rep(1, n_series)                # estimate over a 1-quarter window
+# -------------------------------------------------------------------------
+
+cat("Shock index:", shock_index_int, "\n")
+cat("Shock time vector:", paste(shock_time_vector, collapse = ", "), "\n")
+
+# Explicitly specify ARIMA components for deterministic fitting
+non_seasonal_order <- c(0, 1, 1) # non-seasonal (p,d,q)
+seasonal_comp      <- c(0, 1, 1) # seasonal (P,D,Q)
+data_frequency     <- 4          # quarterly data
+
+# Build a dummy covariate (all ones) per series just to satisfy the interface
+# (We will NOT use it as xreg in ARIMA fits since covariate_indices = NULL)
+X_all_dummy <- lapply(Y_all_aligned, function(yi){
+  xts(rep(1, NROW(yi)), order.by = index(yi))
+})
+
+# Run the model
+seasonal_test_result <- SynthPrediction(
+  Y_series_list          = Y_all_aligned,
+  covariates_series_list = X_all_dummy,      # exists; used for DBW only here
+  shock_time_vec         = shock_time_vector,
+  shock_length_vec       = shock_length_vector,
+  k                      = 1,                # 1-step-ahead from preT
+
+  covariate_indices      = NULL,             # do NOT feed xreg into ARIMA
+  seasonal               = TRUE,             # enable seasonal modeling
+  arima_order            = non_seasonal_order,
+  seasonal_order         = seasonal_comp,
+  seasonal_period        = data_frequency,   # quarterly seasonality
+
+  dbw_indices            = 1,                # allow DBW; falls back to equal weights if constant
+  plots                  = FALSE
+)
+
+# Inspect results
+cat("--- Seasonal test result ---\n")
+print(seasonal_test_result$meta)
+print(seasonal_test_result$predictions)
+
+```
+```{r}
+# --- Re-run Test 1 to enter the debug path ---
+cat("\n--- Debugging Test 1: auto.arima with seasonal=TRUE ---\n")
+
+# Use a fresh variable name to avoid clobbering previous results
+test_1_debug_result <- tryCatch({
+  SynthPrediction(
+    Y_series_list          = Y_all_aligned,
+    covariates_series_list = X_all_dummy,
+    shock_time_vec         = shock_time_vector,
+    shock_length_vec       = shock_length_vector,
+    k                      = 1,
+    arima_order            = NULL,   # activate auto.arima
+    seasonal               = TRUE,   # trigger seasonal path (may fail if no seasonality)
+    covariate_indices      = NULL,   # do not pass xreg into ARIMA
+    dbw_indices            = 1,      # allow DBW; will fallback to equal weights if needed
+    plots                  = FALSE,
+    approximation          = FALSE   # match the latest function signature/behavior
+  )
+}, error = function(e) e)
+
+# Inspect result; main goal is to hit the error path for debugging
+if (inherits(test_1_debug_result, "error")) {
+  cat("❌ Test 1 failed during debug run:", conditionMessage(test_1_debug_result), "\n")
+} else {
+  cat("✅ Test 1 succeeded during debug run.\n")
+}
+print(test_1_debug_result)
+
+```
+```{r}
+# Assume we have already computed shock_index_int = 40 
+# (i.e., the last pre-shock quarter is index 40; shock starts at index 41 = 2020 Q2).
+n_series <- length(Y_all_aligned)
+shock_time_vector   <- rep(40, n_series)  # same pre-shock index for all series
+shock_length_vector <- rep(1,  n_series)  # estimate donor fixed effect over 1 quarter
+
+res <- SynthPrediction(
+  Y_series_list          = Y_all_aligned,
+  covariates_series_list = NULL,      # no xreg / no DBW in this run
+  shock_time_vec         = shock_time_vector,
+  shock_length_vec       = shock_length_vector,
+  k                      = 1,         # 1-step ahead from preT → predicts the shock quarter
+  seasonal               = TRUE,      # allow seasonal modeling (auto-detected in function)
+  covariate_indices      = NULL,      # ensure xreg path is off
+  plots                  = FALSE
+)
+
+# Read outputs
+res$predictions$unadjusted   # pure (S)ARIMA forecast
+res$predictions$adjusted     # (S)ARIMA + weighted shock adjustment (recommended)
+res$meta$weights             # equal weights (DBW disabled → fallback to uniform)
+res$meta$omega_vec           # donor-specific shock effects (post-shock indicator coefficients)
+
+```
+
+
+```{r}
+# --- 1) Build features: lag1 / diff1 / MA(4) ------------------------------------
+X_feat <- lapply(Y_all_aligned, function(y) {
+  v     <- as.numeric(y)
+  lag1  <- c(NA, head(v, -1))                 # previous quarter value
+  diff1 <- c(NA, diff(v))                     # first difference (QoQ change)
+  ma4   <- zoo::rollmean(v, 4, fill = NA, align = "right")  # trailing 4-Q average
+  xts(cbind(lag1, diff1, ma4), order.by = index(y))
+})
+
+# --- 2) Shock location: set at 2020 Q1 (we will predict Q2 = preT + 1) ----------
+preT <- vapply(
+  Y_all_aligned,
+  function(ts) which(index(ts) == as.yearqtr("2020 Q1"))[1],
+  integer(1)
+)
+
+# Sanity checks:
+# - MA(4) needs at least 4 observations
+# - Q2 (preT + 1) must exist in all series
+stopifnot(
+  all(preT >= 4L),
+  all(preT + 1L <= vapply(Y_all_aligned, NROW, 1L))
+)
+
+# --- 3) Run SynthPrediction: use DBW on 3 features; keep ARIMA without xreg -----
+res <- SynthPrediction(
+  Y_series_list          = Y_all_aligned,
+  covariates_series_list = X_feat,       # used for DBW only
+  shock_time_vec         = preT,         # shock at 2020 Q1 for each series
+  shock_length_vec       = rep(1L, length(preT)),
+  k                      = 1L,           # 1-step → predict Q2 (preT + 1)
+  seasonal               = TRUE,         # seasonality allowed (auto check inside)
+  use_dbw                = TRUE,         # enable donor balancing
+  dbw_indices            = 1:3,          # use lag1/diff1/ma4 for DBW
+  covariate_indices      = NULL,         # do NOT pass features to ARIMA as xreg
+  plots                  = FALSE
+)
+
+# --- 4) Extract the 1-step predictions ------------------------------------------
+pred_unadj <- as.numeric(res$predictions$unadjusted[1])     # pure (S)ARIMA
+pred_adj   <- as.numeric(res$predictions$adjusted[1])       # + weighted shock
+pred_mean  <- as.numeric(res$predictions$arithmetic_mean[1])# + mean shock
+
+# --- 5) Ground truth for Q2 (= preT + 1) ----------------------------------------
+y_true_Q2 <- {
+  yy <- Y_all_aligned[[1L]]            # target series (first entry)
+  id <- preT[1L] + 1L
+  if (!is.na(id) && id >= 1L && id <= NROW(yy)) as.numeric(yy[id]) else NA_real_
+}
+
+# --- 6) Comparison table ---------------------------------------------------------
+out_tbl <- data.frame(
+  series    = names(Y_all_aligned)[1],
+  true_Q2   = y_true_Q2,
+  pred_raw  = pred_unadj,
+  pred_adj  = pred_adj,
+  pred_mean = pred_mean,
+  err_raw   = pred_unadj - y_true_Q2,
+  err_adj   = pred_adj   - y_true_Q2,
+  err_mean  = pred_mean  - y_true_Q2,
+  check.names = FALSE
+)
+
+print(out_tbl, row.names = FALSE)
+
+
+```
+
+
+ 
+
+ 
+
+ 

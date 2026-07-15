@@ -1,0 +1,466 @@
+---
+title: "sim-test"
+author: "Qiyang Wang"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    toc_depth: 4
+urlcolor: blue
+---
+```{r}
+devtools::load_all(".")
+library(postshock)
+```
+## Round 1: Basic Prediction without Covariates
+```{r}
+library(forecast)   # Provides auto.arima, Arima, and forecast/predict functions
+library(lmtest)     # Provides coeftest for extracting regression coefficients
+library(xts)        # Provides the ’xts’ time-series data structure
+
+set.seed(42)
+# Generate a 200-day date index from 2021-01-01 to 2021-07-19
+dates <- seq.Date(from = as.Date("2021-01-01"), by = "day", length.out = 200)
+
+# Create the target series as a random walk with a constant offset of 100
+y_target <- cumsum(rnorm(200, mean = 0, sd = 1)) + 100
+Y0 <- xts(y_target, order.by = dates)   # Convert to an xts time series
+
+# Create the donor series identical to the target (for structural testing)
+Y1 <- Y0
+
+# Combine target and donor into a list of time series
+Y_series_list <- list(Y0, Y1)
+
+# Build covariate series: here we supply a single “all-ones” covariate for each series
+covariates_series_list <- list(
+  xts(rep(1, 200), order.by = dates),  # Covariate for the target series
+  xts(rep(1, 200), order.by = dates)   # Covariate for the donor series
+)
+
+# Define shock times and shock lengths: both series experience a “shock” at time index 150 for 1 step
+shock_time_vec   <- c(150, 150)
+shock_length_vec <- c(1, 1)
+
+# Call the SynthPrediction function with minimal settings
+res_minimal <- SynthPrediction(
+  Y_series_list          = Y_series_list,          # List of target + donor series
+  covariates_series_list = covariates_series_list, # List of covariate series (all-ones)
+  shock_time_vec         = shock_time_vec,         # Indices at which shock begins for each series
+  shock_length_vec       = shock_length_vec,       # Duration of shock for each series (1 step)
+  k                      = 1,                      # Forecast horizon: predict 1 step ahead
+  covariate_indices      = NULL,                   # Do not use any user-specified covariate columns
+  seasonal               = FALSE,                  # Disable seasonal ARIMA components
+  plots                  = FALSE                   # Disable plotting of results
+)
+
+# Inspect the structure of the returned object
+str(res_minimal)
+``` 
+## Round 2: Correctness of Covariate Mechanism
+
+In this round, we will test the `SynthPrediction()` function with a more complex setup that includes covariates. This will help us verify that the function correctly handles multiple donors, applies the distance‐based weighting, and integrates covariate information into the ARIMA modeling.
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+set.seed(123)  
+# Fix the random seed so that generated random values are reproducible.
+dates <- seq.Date(
+  from = as.Date("2021-01-01"), 
+  by   = "day", 
+  length.out = 200
+)
+# Create a sequence of 200 daily dates starting from 2021-01-01;
+# this will serve as the time index for our xts time series.
+y0_values <- cumsum(rnorm(200, mean = 0, sd = 1)) + 100  
+# Generate 200 independent N(0,1) random draws, then take their cumulative sum
+# to simulate a random walk, and finally add 100 as a baseline offset.
+Y0 <- xts(y0_values, order.by = dates)
+# Convert y0_values into an xts time series, indexed by the "dates" sequence.
+y1_values <- y0_values + rnorm(200, mean = 0, sd = 0.1)  
+# Produce a “donor” series by taking Y0’s values and adding small N(0,0.1) noise,
+# making Y1 very highly correlated with Y0 but not identical.
+Y1 <- xts(y1_values, order.by = dates)
+# Convert y1_values into an xts time series, sharing the same dates index.
+y2_values <- y0_values + rnorm(200, mean = 0, sd = 2)  
+# Produce another “donor” series by adding larger N(0,2) noise to Y0,
+# so that Y2 is less correlated with Y0 than Y1 is.
+Y2 <- xts(y2_values, order.by = dates)
+# Convert y2_values into an xts time series, using the same dates index.
+Y_series_list <- list(Y0, Y1, Y2)
+# Bundle the three xts objects (target + two donors) into a list for input to SynthPrediction.
+# 4. Construct corresponding covariate series X0, X1, X2 --------------------------
+#    X0 and X1 are both built from the same underlying “base_signal”, so they will correlate well with Y0 and Y1.
+base_signal <- cumsum(rnorm(200, mean = 0, sd = 1))  
+# Generate a second random walk (“base signal”) by cumulatively summing 200 N(0,1) draws.
+# This base_signal will be used to create correlated covariates.
+X0_values  <- base_signal + rnorm(200, mean = 0, sd = 0.1)  
+# Construct X0 by adding small N(0,0.1) noise to base_signal,
+# ensuring X0 is highly correlated with base_signal (and thus with Y0/Y1 to some extent).
+X1_values  <- base_signal + rnorm(200, mean = 0, sd = 0.1)  
+# Construct X1 similarly, so that X1 is also highly correlated with base_signal (and thus with Y1).
+#    X2 is generated independently, making it less informative about Y0/Y1/Y2.
+X2_values  <- cumsum(rnorm(200, mean = 0, sd = 2))  
+# Create a new random walk with larger noise (sd=2), so X2 is effectively uncorrelated with base_signal.
+X0 <- xts(X0_values, order.by = dates)
+# Convert X0_values to an xts object indexed by the same “dates”.
+X1 <- xts(X1_values, order.by = dates)
+# Convert X1_values to an xts object with identical dates index.
+X2 <- xts(X2_values, order.by = dates)
+# Convert X2_values to an xts object with the same dates index.
+# 5. Define shock times and shock durations -------------------------------
+#    We simulate an event (“shock”) occurring at time index 150 for all three series, lasting 1 step.
+shock_time_vec   <- c(150, 150, 150)
+# Each element corresponds to the time index where a shock begins:
+# positions 1–3 match Y0, Y1, Y2 respectively.
+shock_length_vec <- c(1, 1, 1)
+# Each element indicates the shock’s length (in time steps),
+# here set to 1 for all three series.
+Y_series_list <- list(Y0, Y1, Y2)
+covariates_series_list <- list(X0, X1, X2)
+
+res_with_cov <- SynthPrediction(
+  Y_series_list = Y_series_list,
+  covariates_series_list = covariates_series_list,
+  shock_time_vec = shock_time_vec,
+  shock_length_vec = shock_length_vec,
+  k = 1,
+  covariate_indices = 1,   
+  seasonal = FALSE,
+  plots = FALSE
+)
+res_with_cov
+Y_series_list[[1]][150:151]  
+```
+
+## Round 3: Covariate Sensitivity and Robustness Analysis 
+- **Covariate setup**  
+  - 1st covariate = `base_signal` + small noise (informative)  
+  - Others = independent random walks (noise)
+
+- **Tested k = 1, 3, 5**  
+  - **k = 1**  
+    - Weights ≈ (1.00, 0.00)  
+    - RMSE = 0.072 
+    - ⚠️ “Hessian inversion” warning → low-dim instability  
+  - **k = 3**  
+    - Weights ≈ (0.10405, 0.89595)  
+    - RMSE = 0.693
+  - **k = 5**  
+    - Weights ≈ (0.68864, 0.31136)  
+    - RMSE = 0.401
+
+- **Key takeaway**  
+  Higher proportion of noise covariates → worse RMSE.  
+  Use small regularization (`penalty_lambda > 0`) for stable weight estimates in low-dim cases.
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+# --- Round 3: Covariate Sensitivity and Robustness Analysis ---
+set.seed(123)
+# 1. Prepare series length and date index
+len   <- nrow(Y_series_list[[1]])
+dates <- index(Y_series_list[[1]])
+
+# 2. Covariate generator:
+#    - 1st column carries base signal + small noise
+#    - Remaining columns are independent random-walk noise
+generate_covariates <- function(k) {
+  base_signal <- cumsum(rnorm(len))
+  mat <- sapply(seq_len(k), function(j) {
+    if (j == 1) {
+      base_signal + rnorm(len, 0, 0.1)
+    } else {
+      cumsum(rnorm(len, 0, 3))
+    }
+  })
+  xts(mat, order.by = dates)
+}
+
+# 3. RMSE function
+rmse <- function(pred, truth) {
+  p <- coredata(pred)
+  t <- coredata(truth)
+  sqrt(mean((p - t)^2, na.rm = TRUE))
+}
+
+# 4. Test model performance for k = 1, 3, 5 covariates
+results <- list()
+for (k in c(1, 3, 5)) {
+  cat("==== Now testing with", k, "covariates ====\n")
+  
+  # 4.1 Generate k covariates for each series
+  cov_list <- lapply(seq_along(Y_series_list), function(i) 
+    generate_covariates(k)
+  )
+  
+  # 4.2 Run the SynthPrediction function
+  res <- SynthPrediction(
+    Y_series_list          = Y_series_list,
+    covariates_series_list = cov_list,
+    shock_time_vec         = shock_time_vec,
+    shock_length_vec       = shock_length_vec,
+    k                      = 1,
+    covariate_indices      = 1:k,
+    seasonal               = FALSE,
+    plots                  = FALSE,
+    penalty_lambda         = 1e-4,
+    penalty_normchoice     = "l2"
+  )
+  
+  # 4.3 Extract true and predicted values
+  true_val  <- Y_series_list[[1]][ shock_time_vec[1] + 1 ]
+  arima_val <- res$predictions$unadjusted
+  synth_val <- res$predictions$adjusted
+  mean_val  <- res$predictions$arithmetic_mean
+  
+  # 4.4 Compute RMSE for each method
+  err_arima <- rmse(arima_val, true_val)
+  err_synth <- rmse(synth_val, true_val)
+  err_mean  <- rmse(mean_val,  true_val)
+  
+  # 4.5 Print comparison of true vs. predicted values and errors
+  cat(sprintf(
+    "k=%d | true=%.3f | ARIMA=%.3f(err=%.3f) | synth=%.3f(err=%.3f) | mean=%.3f(err=%.3f)\n",
+    k,
+    coredata(true_val),
+    coredata(arima_val), err_arima,
+    coredata(synth_val), err_synth,
+    coredata(mean_val),  err_mean
+  ))
+  
+  # 4.6 Save results into summary list
+  results[[paste0("k_", k)]] <- list(
+    rmse_arima    = err_arima,
+    rmse_synth    = err_synth,
+    rmse_mean_adj = err_mean,
+    weights       = res$linear_combinations
+  )
+}
+
+# 5. Inspect summarized results
+str(results)
+```
+
+## Round 4 (fixed): Shock Mechanism & Adjustment Logic Validation with Proper Alignment
+
+```{r Round4_fixed, message=FALSE, warning=FALSE, echo=FALSE}
+library(xts)
+library(forecast)
+library(lmtest)
+library(TTR)
+
+# —— 1. Define a function to compute cleaned technical indicators —— #
+make_technical_indicators <- function(Y) {
+  # 1a) Compute raw indicators (may include NA values at the beginning)
+  raw_df <- cbind(
+    MA5  = runMean(coredata(Y), n = 5),      # 5-period moving average
+    MA10 = runMean(coredata(Y), n = 10),     # 10-period moving average
+    Vol  = runSD(coredata(Y),   n = 10),     # 10-period rolling standard deviation (volatility)
+    Mom  = c(NA, diff(coredata(Y)))          # true momentum: Y[t] - Y[t-1]
+  )
+  
+  # 1b) Identify rows with no missing values
+  good <- complete.cases(raw_df)
+  
+  # 1c) Subset the raw matrix and align timestamps
+  df  <- raw_df[good, , drop = FALSE]
+  idx <- index(Y)[good]
+  
+  # 1d) Return as an xts object with the filtered time index
+  xts(df, order.by = idx)
+}
+
+# —— 2. Generate cleaned covariate list for each series Y0, Y1, Y2 —— #
+cov_list_clean <- lapply(list(Y0, Y1, Y2), make_technical_indicators)
+
+# —— 3. Align the original series to the covariate timestamps —— #
+common_index <- index(cov_list_clean[[1]])
+Y_clean_list <- lapply(list(Y0, Y1, Y2), `[`, common_index)
+
+# —— 4. Print and verify the covariates and aligned series —— #
+cat("== First 10 rows of covariates (MA5, MA10, Vol, Mom) ==\n")
+print(head(cov_list_clean[[1]], 10))
+
+cat("\n== Summary of covariates ==\n")
+print(summary(cov_list_clean[[1]]))
+
+cat("\n== First 10 rows of aligned target series Y0 ==\n")
+print(head(Y_clean_list[[1]], 10))
+
+# —— 5. Define the shock parameters —— #
+t0_index   <- 150
+shock_date <- as.character(common_index[t0_index])
+cat("\nShock date identified as:", shock_date, "\n")
+
+# —— 6. Run the synthetic prediction with shock adjustment —— #
+res_round4 <- SynthPrediction(
+  Y_series_list          = Y_clean_list,
+  covariates_series_list = cov_list_clean,
+  shock_time_vec         = shock_time_vec,
+  shock_length_vec       = shock_length_vec,
+  k                      = 1,
+  covariate_indices      = 1:ncol(cov_list_clean[[1]]),
+  seasonal               = FALSE,
+  plots                  = FALSE,      # disable built-in plotting
+  penalty_lambda         = 1e-4,
+  penalty_normchoice     = "l2"
+)
+
+# —— 1. Setup: define shock time index & date —— #
+# Assume Y_clean_list is already available: [[1]] is the treated series,
+# [[2]]~[[n]] are the donor series, and there are at least 155 observations.
+t0_index <- 150
+t0_date  <- index(Y_clean_list[[1]])[t0_index]
+
+# —— 2. Build three shock scenarios —— #
+# 2.1 Local Jump: at t0+1 jump up by +20, then revert to original path
+Y_jump <- lapply(Y_clean_list, function(x) {
+  x2 <- x
+  x2[t0_index + 1] <- coredata(x2[t0_index - 1]) + 20
+  x2
+})
+
+# 2.2 Level Shift: from t0+1 onward, add a permanent +5 elevation
+Y_level <- lapply(Y_clean_list, function(x) {
+  x2 <- x
+  idx <- (t0_index + 1):nrow(x2)
+  x2[idx] <- coredata(x2[idx]) + 5
+  x2
+})
+
+# 2.3 Volatility Shock: from t0+1 onward, add N(0,3) noise each period
+set.seed(42)
+Y_vol <- lapply(Y_clean_list, function(x) {
+  x2 <- x
+  idx <- (t0_index + 1):nrow(x2)
+  x2[idx] <- coredata(x2[idx]) + rnorm(length(idx), mean = 0, sd = 3)
+  x2
+})
+
+# —— 3. Combine into a named list of scenarios —— #
+scenarios <- list(
+  Jump  = Y_jump,
+  Level = Y_level,
+  Vol   = Y_vol
+)
+
+# —— 4. For each scenario, print the ±5 day window around the shock —— #
+window_half <- 5
+for (name in names(scenarios)) {
+  # extract the treated series for this scenario
+  Y_scn <- scenarios[[name]][[1]]
+  
+  # compute the index range, handling boundaries
+  start_idx <- max(1,                 t0_index - window_half)
+  end_idx   <- min(nrow(Y_scn),       t0_index + window_half)
+  idx_range <- start_idx:end_idx
+  
+  cat(sprintf(
+    "\n=== %s Shock: t0 = %s (index %d), ±%d days ===\n",
+    name, as.character(t0_date), t0_index, window_half
+  ))
+  
+  # — Basic setup —
+n_series       <- length(Y_clean_list)
+t0_index       <- 150
+shock_time_vec <- rep(t0_index, n_series)
+len_post       <- nrow(Y_clean_list[[1]]) - t0_index
+
+# shock lengths for each scenario
+shock_length_jump  <- rep(1,       n_series)  # only next period
+shock_length_level <- rep(len_post, n_series) # from t0+1 to end
+shock_length_vol   <- rep(len_post, n_series) # idem
+
+# covariates and indices
+covars  <- cov_list_clean
+cov_idx <- seq_len(ncol(covars[[1]]))
+
+# public params
+k_steps  <- 1
+seasonal <- FALSE
+plots    <- FALSE
+λ        <- 1e-4
+norm     <- "l2"
+
+# — 1. Local Jump (+20 at t0) —
+true_jump <- as.numeric(Y_jump[[1]][t0_index + 1])
+res_jump  <- SynthPrediction(
+  Y_series_list          = Y_jump,
+  covariates_series_list = covars,
+  shock_time_vec         = shock_time_vec,
+  shock_length_vec       = shock_length_jump,
+  k                      = k_steps,
+  covariate_indices      = cov_idx,
+  seasonal               = seasonal,
+  plots                  = plots,
+  penalty_lambda         = λ,
+  penalty_normchoice     = norm
+)
+raw_jump <- as.numeric(res_jump$predictions$unadjusted)
+syn_jump <- as.numeric(res_jump$predictions$adjusted)
+
+cat(sprintf(
+  "Jump  | true=%.3f | ARIMA=%.3f (err=%.3f) | synth+shock=%.3f (err=%.3f)\n\n",
+  true_jump,
+  raw_jump, abs(raw_jump - true_jump),
+  syn_jump, abs(syn_jump - true_jump)
+))
+
+# (Optional) dump full structure for Jump
+cat("---- Full res_jump object ----\n")
+str(res_jump)
+cat("---- End of res_jump dump ----\n\n")
+
+
+# — 2. Level Shift (+5 from t0+1 onward) —
+true_level <- as.numeric(Y_level[[1]][t0_index + 1])
+res_level  <- SynthPrediction(
+  Y_series_list          = Y_level,
+  covariates_series_list = covars,
+  shock_time_vec         = shock_time_vec,
+  shock_length_vec       = shock_length_level,
+  k                      = k_steps,
+  covariate_indices      = cov_idx,
+  seasonal               = seasonal,
+  plots                  = plots,
+  penalty_lambda         = λ,
+  penalty_normchoice     = norm
+)
+raw_level <- as.numeric(res_level$predictions$unadjusted)
+syn_level <- as.numeric(res_level$predictions$adjusted)
+
+cat(sprintf(
+  "Level | true=%.3f | ARIMA=%.3f (err=%.3f) | synth+shock=%.3f (err=%.3f)\n\n",
+  true_level,
+  raw_level, abs(raw_level - true_level),
+  syn_level, abs(syn_level - true_level)
+))
+
+
+# — 3. Volatility Shock (iid N(0,σ) noise from t0+1) —
+true_vol <- as.numeric(Y_vol[[1]][t0_index + 1])
+res_vol  <- SynthPrediction(
+  Y_series_list          = Y_vol,
+  covariates_series_list = covars,
+  shock_time_vec         = shock_time_vec,
+  shock_length_vec       = shock_length_vol,
+  k                      = k_steps,
+  covariate_indices      = cov_idx,
+  seasonal               = seasonal,
+  plots                  = plots,
+  penalty_lambda         = λ,
+  penalty_normchoice     = norm
+)
+raw_vol <- as.numeric(res_vol$predictions$unadjusted)
+syn_vol <- as.numeric(res_vol$predictions$adjusted)
+
+cat(sprintf(
+  "Vol   | true=%.3f | ARIMA=%.3f (err=%.3f) | synth+shock=%.3f (err=%.3f)\n",
+  true_vol,
+  raw_vol, abs(raw_vol - true_vol),
+  syn_vol, abs(syn_vol - true_vol)
+))
+}
+ 
+
+```
+
+ 

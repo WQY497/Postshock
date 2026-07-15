@@ -1,0 +1,836 @@
+---
+title: "simapple"
+author: "Qiyang Wang"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+```{r}
+library(tidyverse)
+library(lubridate)
+if (requireNamespace("devtools", quietly = TRUE)) {
+  devtools::load_all("..")  
+} else {
+  library(postshock)
+}
+```
+
+```{r, message=FALSE, warning=FALSE}
+ local({
+  suppressPackageStartupMessages(library(xts))
+
+  set.seed(456)
+
+  gt_n <- 220L
+  gt_dates <- seq.Date(from = as.Date("2021-01-01"), by = "day", length.out = gt_n)
+
+  # Random-walk around 100 (same scale as typical ARIMA level forecasts)
+  gt_y0 <- cumsum(rnorm(gt_n, 0, 1)) + 100
+
+  # Confounder window (control should remove it)
+  gt_t_conf   <- 120L
+  gt_len_conf <- 8L
+  gt_amp_conf <- +6
+  gt_y0[gt_t_conf:(gt_t_conf + gt_len_conf - 1)] <-
+    gt_y0[gt_t_conf:(gt_t_conf + gt_len_conf - 1)] + gt_amp_conf
+
+  # Main shock affects t_main+1 (k=1 predicts this point)
+  gt_t_main   <- 150L
+  gt_amp_main <- +10
+  gt_y0[gt_t_main + 1] <- gt_y0[gt_t_main + 1] + gt_amp_main
+
+  gt_Y0 <- xts::xts(gt_y0, order.by = gt_dates)
+
+  # donors: remove confounder effect so they help explain it away
+  gt_conf_mask <- seq_len(gt_n) %in% gt_t_conf:(gt_t_conf + gt_len_conf - 1)
+  gt_y1 <- (gt_y0 - ifelse(gt_conf_mask, gt_amp_conf, 0)) + rnorm(gt_n, 0, 0.3)
+  gt_y2 <- (gt_y0 - ifelse(gt_conf_mask, gt_amp_conf, 0)) + rnorm(gt_n, 0, 1.0)
+
+  gt_Y1 <- xts::xts(gt_y1, order.by = gt_dates)
+  gt_Y2 <- xts::xts(gt_y2, order.by = gt_dates)
+  gt_Y_series_list <- list(gt_Y0, gt_Y1, gt_Y2)
+
+  # covariates (1 col per series)
+  gt_x_base <- cumsum(rnorm(gt_n, 0, 1))
+  gt_X0 <- xts::xts(gt_x_base + rnorm(gt_n, 0, 0.2), order.by = gt_dates)
+  gt_X1 <- xts::xts(gt_x_base + rnorm(gt_n, 0, 0.2), order.by = gt_dates)
+  gt_X2 <- xts::xts(0.4 * gt_x_base + rnorm(gt_n, 0, 1.0), order.by = gt_dates)
+  gt_covariates_series_list <- list(gt_X0, gt_X1, gt_X2)
+
+  gt_shock_time_vec   <- c(gt_t_main, gt_t_main, gt_t_main)
+  gt_shock_length_vec <- c(1L, 1L, 1L)
+  gt_k <- 1L
+
+  # control only on target
+  gt_control_shocks <- vector("list", length(gt_Y_series_list))
+  gt_control_shocks[[1]] <- list(list(time = gt_t_conf, length = gt_len_conf, shape = "window"))
+
+  gt_truth <- as.numeric(gt_Y0[gt_t_main + 1])
+  stopifnot(is.finite(gt_truth))
+
+  take_k1 <- function(v) {
+    v <- as.numeric(v)
+    stopifnot(length(v) >= 1L, !anyNA(v), all(is.finite(v)))
+    v[1]
+  }
+
+  gt_res_no <- suppressWarnings(
+    SynthPrediction(
+      Y_series_list = gt_Y_series_list,
+      covariates_series_list = gt_covariates_series_list,
+      shock_time_vec = gt_shock_time_vec,
+      shock_length_vec = gt_shock_length_vec,
+      k = gt_k,
+      covariate_indices = 1,
+      seasonal = FALSE,
+      plots = FALSE,
+      use_dbw = TRUE
+    )
+  )
+
+  gt_res_ctl <- suppressWarnings(
+    SynthPrediction(
+      Y_series_list = gt_Y_series_list,
+      covariates_series_list = gt_covariates_series_list,
+      shock_time_vec = gt_shock_time_vec,
+      shock_length_vec = gt_shock_length_vec,
+      k = gt_k,
+      covariate_indices = 1,
+      control_shocks = gt_control_shocks,
+      seasonal = FALSE,
+      plots = FALSE,
+      use_dbw = TRUE
+    )
+  )
+
+  no_unadj  <- take_k1(gt_res_no$predictions$unadjusted)
+  no_adj    <- take_k1(gt_res_no$predictions$adjusted)
+  ctl_unadj <- take_k1(gt_res_ctl$predictions$unadjusted)
+  ctl_adj   <- take_k1(gt_res_ctl$predictions$adjusted)
+
+  err_no_unadj  <- abs(no_unadj  - gt_truth)
+  err_no_adj    <- abs(no_adj    - gt_truth)
+  err_ctl_unadj <- abs(ctl_unadj - gt_truth)
+  err_ctl_adj   <- abs(ctl_adj   - gt_truth)
+
+  cat("\n================= [SynthPrediction] 1-step Ground Truth =================\n")
+  cat("t_main =", gt_t_main, "(predicting t_main+1)\n")
+  cat("Truth  =", round(gt_truth, 6), "\n\n")
+  cat("NO CONTROL:\n")
+  cat("  unadjusted =", round(no_unadj, 6),  "| abs err =", round(err_no_unadj, 6), "\n")
+  cat("  adjusted   =", round(no_adj, 6),    "| abs err =", round(err_no_adj, 6),   "\n\n")
+  cat("WITH CONTROL:\n")
+  cat("  unadjusted =", round(ctl_unadj, 6), "| abs err =", round(err_ctl_unadj, 6), "\n")
+  cat("  adjusted   =", round(ctl_adj, 6),   "| abs err =", round(err_ctl_adj, 6),   "\n")
+  cat("==========================================================================\n\n")
+
+  # soft sanity (not too strict)
+  stopifnot(err_ctl_adj <= 5 * err_no_adj + 1e-8)
+})
+
+```
+
+
+```{r}
+suppressPackageStartupMessages({
+  library(quantmod)
+  library(xts)
+})
+
+use_teacher_close <- TRUE
+
+getSymbols(c("AAPL", "^GSPC", "^IRX"), src = "yahoo", from = "2000-01-01")
+
+pick_price <- function(x, use_close = TRUE) {
+  if (use_close) return(Cl(x))
+  out <- tryCatch(Ad(x), error = function(e) NULL)
+  if (is.null(out) || ncol(out) == 0) return(Cl(x))
+  out
+}
+
+aapl <- pick_price(AAPL, use_close = use_teacher_close)
+gspc <- pick_price(GSPC, use_close = use_teacher_close)
+
+irx <- tryCatch(Cl(IRX), error = function(e) NULL)
+if (is.null(irx) || ncol(irx) == 0) irx <- IRX[, NCOL(IRX), drop = FALSE]
+
+Z <- Reduce(function(x, y) merge(x, y, join = "inner"), list(aapl, gspc, irx))
+Z <- na.omit(Z)
+colnames(Z) <- c("AAPL", "GSPC", "IRX")
+
+cat("dim(Z) =", paste(dim(Z), collapse=" x "), "\n")
+cat("start/end =", as.character(start(Z)), "->", as.character(end(Z)), "\n")
+cat("anyNA(Z) =", anyNA(Z), "\n")
+
+```
+```{r}
+d0 <- as.Date(c("2017-06-06","2017-06-07","2017-06-08"))
+print(Z[d0, c("AAPL","GSPC","IRX")])
+
+dates <- as.Date(index(Z))
+
+find_trading_index <- function(dates, shock_date, rule=c("next","prev","nearest")) {
+  rule <- match.arg(rule)
+  shock_date <- as.Date(shock_date)
+  idx <- which(dates == shock_date)
+  if (length(idx) == 1L) return(idx)
+
+  if (rule=="next") return(which(dates > shock_date)[1])
+  if (rule=="prev") return(tail(which(dates < shock_date), 1))
+  which.min(abs(as.numeric(dates - shock_date)))
+}
+
+# 这些是“中间点 / event day”
+shock_dates_prof <- as.Date(c("2017-06-06","2018-10-30","2019-06-03"))
+
+# event day index（如果当天是交易日，next 就会返回当天本身）
+idx_event <- sapply(shock_dates_prof, \(d) find_trading_index(dates, d, "next"))
+
+# effect day = next trading day（给 k=1 的 effect 用）
+idx_effect <- idx_event + 1L
+stopifnot(all(idx_effect <= length(dates)))
+
+tab_prof <- data.frame(
+  source     = "prof",
+  event_date = shock_dates_prof,
+  event_day  = dates[idx_event],   # 应该等于输入日期（如果输入本来就是交易日）
+  idx_event  = idx_event,
+  effect_day = dates[idx_effect],
+  idx_effect = idx_effect
+)
+print(tab_prof)
+
+print_window <- function(Z, idx, w = 2) {
+  rng <- (idx - w):(idx + w)
+  rng <- rng[rng >= 1 & rng <= nrow(Z)]
+  data.frame(
+    date = as.Date(index(Z)[rng]),
+    AAPL = as.numeric(Z[rng, "AAPL"]),
+    GSPC = as.numeric(Z[rng, "GSPC"]),
+    IRX  = as.numeric(Z[rng, "IRX"]),
+    row.names = NULL
+  )
+}
+
+# 打印：center = event day（你要的“中间点”）
+for (i in seq_len(nrow(tab_prof))) {
+  cat("\n============================\n")
+  cat("Shock", i, "\n")
+  cat("CENTER(event) =", as.character(tab_prof$event_day[i]), "\n")
+  cat("Effect(next)  =", as.character(tab_prof$effect_day[i]), "\n")
+
+  wdat <- print_window(Z, tab_prof$idx_event[i], w = 2)
+  print(wdat)
+
+  # 严格验证：窗口中心行必须是 event day 且数值匹配
+  center_row <- which(wdat$date == tab_prof$event_day[i])
+  stopifnot(length(center_row) == 1L)
+  stopifnot(abs(wdat$AAPL[center_row] - as.numeric(Z[tab_prof$idx_event[i], "AAPL"])) < 1e-12)
+
+  cat("CENTER MATCH OK (event day)\n")
+}
+
+```
+ 
+```{r}
+suppressPackageStartupMessages({
+  library(xts)
+})
+
+# ============================================================
+# Inflation adjustment (convert nominal prices to "2020 dollars")
+# - CPI series: CPIAUCSL from FRED (monthly)
+# - We compute annual mean CPI, then build a yearly deflator:
+#     deflator(year) = CPI_2020 / CPI_year
+# - For each trading day in Z, we match its calendar year to the deflator.
+# - IMPORTANT: The latest year in CPI may be incomplete and yield NA
+#   (e.g., partial-year data), so we DROP years with NA deflator and
+#   truncate Z to the last valid CPI year.
+# ============================================================
+
+# ----------------------------
+# 1) Load CPI monthly series
+# ----------------------------
+cpi_raw <- read.csv(
+  "https://fred.stlouisfed.org/graph/fredgraph.csv?id=CPIAUCSL",
+  stringsAsFactors = FALSE
+)
+
+# FRED CSV columns are typically: observation_date, CPIAUCSL
+stopifnot(all(c("observation_date", "CPIAUCSL") %in% names(cpi_raw)))
+
+# Parse dates and values (ensure numeric)
+cpi_raw$observation_date <- as.Date(cpi_raw$observation_date)
+cpi_raw$CPIAUCSL <- as.numeric(cpi_raw$CPIAUCSL)
+
+# Build xts (monthly)
+cpi_xts <- xts::xts(cpi_raw$CPIAUCSL, order.by = cpi_raw$observation_date)
+
+# ------------------------------------
+# 2) Annual mean CPI (one value / year)
+# ------------------------------------
+# Use na.rm=TRUE to be robust if any month is NA
+cpi_y <- apply.yearly(cpi_xts, function(x) mean(x, na.rm = TRUE))
+
+# -----------------------------------------
+# 3) Compute yearly deflator to 2020 dollars
+# -----------------------------------------
+yrs <- as.integer(format(index(cpi_y), "%Y"))
+
+# Pull CPI(2020) safely by year match (not relying on exact year-end date)
+cpi_2020 <- as.numeric(cpi_y[yrs == 2020])
+stopifnot(length(cpi_2020) == 1L, is.finite(cpi_2020))
+
+# Deflator: multiply nominal price by this to convert to 2020 dollars
+infl_y <- cpi_2020 / cpi_y
+
+# Put into a plain data.frame (year -> deflator)
+infl_y_df <- data.frame(
+  year         = as.integer(format(index(infl_y), "%Y")),
+  dollars_2020 = as.numeric(infl_y),
+  row.names    = NULL
+)
+
+# ---------------------------------------------------------
+# 4) Drop invalid deflator years and truncate Z accordingly
+# ---------------------------------------------------------
+# Some latest-year CPI can be incomplete -> NA deflator (common cause of errors)
+infl_y_df_ok <- infl_y_df[is.finite(infl_y_df$dollars_2020), ]
+
+# Last year for which we have a valid deflator
+max_cpi_year <- max(infl_y_df_ok$year)
+
+# Truncate Z (xts) to years covered by valid CPI deflators
+# NOTE: Z must exist before running this block, and its index must be Date/POSIXct.
+dates_Z  <- as.Date(index(Z))
+year_Z   <- as.integer(format(dates_Z, "%Y"))
+keep_Z   <- year_Z <= max_cpi_year
+
+Z_trim   <- Z[keep_Z]
+dates_Z  <- dates_Z[keep_Z]
+year_Z   <- year_Z[keep_Z]
+
+# ------------------------------------------------
+# 5) Match each trading day to its yearly deflator
+# ------------------------------------------------
+infl_daily <- infl_y_df_ok$dollars_2020[match(year_Z, infl_y_df_ok$year)]
+stopifnot(length(infl_daily) == nrow(Z_trim), !anyNA(infl_daily))
+
+# --------------------------------------
+# 6) Apply inflation adjustment to prices
+# --------------------------------------
+# Only adjust price series; do NOT adjust interest rate series (IRX).
+Z_infl <- Z_trim
+Z_infl[, c("AAPL", "GSPC")] <- Z_infl[, c("AAPL", "GSPC")] * infl_daily
+# Z_infl[, "IRX"] unchanged
+
+# ----------------------------
+# 7) Diagnostics / sanity checks
+# ----------------------------
+cat("CPI annual range:", min(infl_y_df$year), "to", max(infl_y_df$year), "\n")
+cat("Valid deflator range:", min(infl_y_df_ok$year), "to", max_cpi_year, "\n")
+cat("Z original range:", as.character(start(Z)), "to", as.character(end(Z)), "\n")
+cat("Z truncated range:", as.character(start(Z_trim)), "to", as.character(end(Z_trim)), "\n")
+
+# Show last 3 annual CPI means and last 3 deflators
+print(tail(cpi_y, 3))
+print(tail(infl_y, 3))
+
+# Inspect whether the latest year has NA deflator (typical issue)
+print(infl_y_df[infl_y_df$year %in% c(max_cpi_year, max_cpi_year + 1), ])
+
+# List any "bad" years with invalid deflator (should be empty after filtering)
+bad_years <- sort(unique(infl_y_df$year[!is.finite(infl_y_df$dollars_2020)]))
+print(bad_years)
+
+# Output objects you will use downstream:
+# - Z_infl : inflation-adjusted (2020 dollars) time series, aligned and truncated
+# - Z_trim : truncated nominal series aligned to CPI coverage (if you need nominal too)
+
+```
+
+```{r}
+# shock centers (must be trading days in Z)
+shock_dates_prof <- as.Date(c("2017-06-06","2018-10-30","2019-06-03"))
+
+print_window2 <- function(Z, center_date, w = 2) {
+  center_date <- as.Date(center_date)
+  idx <- which(as.Date(index(Z)) == center_date)
+  if (length(idx) != 1L) stop("center_date not found in Z trading days: ", center_date)
+
+  rng <- (idx - w):(idx + w)
+  rng <- rng[rng >= 1 & rng <= nrow(Z)]
+
+  out <- data.frame(
+    date = as.Date(index(Z)[rng]),
+    is_center = as.Date(index(Z)[rng]) == center_date,
+    AAPL = as.numeric(Z[rng, "AAPL"]),
+    GSPC = as.numeric(Z[rng, "GSPC"]),
+    IRX  = as.numeric(Z[rng, "IRX"]),
+    row.names = NULL
+  )
+  out
+}
+
+for (d in shock_dates_prof) {
+  cat("\n============================\n")
+  cat("CENTER =", as.character(d), "\n")
+
+  cat("\n--- Nominal (Z) ---\n")
+  print(print_window2(Z, d, w = 2))
+
+  cat("\n--- Inflation-adjusted (Z_infl) ---\n")
+  print(print_window2(Z_infl, d, w = 2))
+}
+
+```
+
+```{r}
+# shock date (event date)
+shock_date <- as.Date("2020-11-10")
+
+# trading dates
+dates <- as.Date(index(Z))
+
+# 找到 shock 当天对应的交易日 index
+idx_shock <- which(dates == shock_date)
+stopifnot(length(idx_shock) == 1L)
+
+# target = shock 后一天的 AAPL 价格
+target_date  <- dates[idx_shock + 1]
+target_price <- as.numeric(Z[idx_shock + 1, "AAPL"])
+
+window <- (idx_shock - 1):(idx_shock + 2)
+
+data.frame(
+  date = dates[window],
+  AAPL = as.numeric(Z[window, "AAPL"]),
+  row.names = NULL
+)
+
+
+```
+
+
+```{r}
+# ---- paper-style choices ----
+pre_tgt  <- 24L
+post_tgt <-  2L
+
+pre_don  <- 12L
+post_don <- 12L
+
+k  <- 2L
+Ls <- 1L
+
+target_shock_day <- as.Date("2020-11-10")
+
+# donor 的真实 shock day（不要动）
+donor_shock_days_true <- as.Date(c("2017-06-06","2018-10-30","2019-06-03"))
+
+slice_around <- function(Z, shock_day, pre, post){
+  dates <- as.Date(index(Z))
+  idx <- which(dates == as.Date(shock_day))
+  stopifnot(length(idx) == 1L)
+  Z[(idx-pre):(idx+post), ]
+}
+
+# ---- 1) target window ----
+Z_tgt <- slice_around(Z_infl, target_shock_day, pre = pre_tgt, post = post_tgt)
+shock_time_tgt_local <- pre_tgt + 1L
+
+# ---- 2) donor windows（以真实 shock day 切窗，不要用 shock-5） ----
+Z_don_list <- lapply(donor_shock_days_true, \(d) slice_around(Z_infl, d, pre = pre_don, post = post_don))
+shock_time_don_local <- pre_don + 1L
+
+# ---- 3) assemble inputs ----
+Y_series_list <- c(
+  list(Z_tgt[, "AAPL", drop = FALSE]),
+  lapply(Z_don_list, \(zz) zz[, "AAPL", drop = FALSE])
+)
+
+X_for_dbw <- c(
+  list(Z_tgt[, c("GSPC","IRX"), drop = FALSE]),
+  lapply(Z_don_list, \(zz) zz[, c("GSPC","IRX"), drop = FALSE])
+)
+
+# ---- 4) shock time vectors (local indices) ----
+shock_time_vec   <- c(shock_time_tgt_local, rep(shock_time_don_local, length(Z_don_list)))
+shock_length_vec <- rep(Ls, length(Y_series_list))
+
+# ---- 5) control shocks (target only) ----
+other_shock_days <- as.Date("2020-10-10")
+
+dates_tgt <- as.Date(index(Z_tgt))
+idx_other_local <- sapply(other_shock_days, \(d){
+  ii <- which(dates_tgt == d)
+  if (length(ii) == 0L) NA_integer_ else ii
+})
+idx_other_local <- idx_other_local[is.finite(idx_other_local)]
+idx_other_local <- idx_other_local[idx_other_local <= shock_time_tgt_local]
+
+control_shocks <- if (length(idx_other_local) == 0L) {
+  NULL
+} else {
+  lapply(idx_other_local, \(t0) list(time = as.integer(t0), length = 1L, shape = "point"))
+}
+
+# ---- run ----
+out <- SynthPrediction(
+  Y_series_list = Y_series_list,
+  covariates_series_list = X_for_dbw,
+  shock_time_vec = shock_time_vec,
+  shock_length_vec = shock_length_vec,
+  k = 1,
+  use_dbw = TRUE,
+  dbw_indices = 1:2,
+  covariate_indices = NULL,
+  arima_order = NULL,
+  seasonal = FALSE,
+  control_shocks = control_shocks,
+  dbw_center = TRUE,
+  dbw_scale  = TRUE,
+  days_before_shocktime_vec = 10L,
+
+  plots = TRUE
+)
+
+
+out$meta$weights
+out$meta$omega_vec
+out$predictions
+```
+replication for apple
+```{r}
+# Key dates
+release_day       <- as.Date("2020-11-10")
+target_day        <- as.Date("2020-11-11")
+last_obs_day      <- as.Date("2020-11-10")
+control_shock_day <- as.Date("2020-10-09")
+
+# Donor shock-effect dates from the paper
+donor_effect_days <- as.Date(c("2017-06-07", "2018-10-31", "2019-06-04"))
+
+# Window lengths
+pre_tgt  <- 24L
+pre_don  <- 12L
+post_don <- 12L
+Ls       <- 1L
+
+# Helper to extract a local window around a given date
+slice_around <- function(Z, shock_day, pre, post) {
+  dates <- as.Date(index(Z))
+  idx <- which(dates == as.Date(shock_day))
+  Z[(idx - pre):(idx + post), ]
+}
+
+# Construct target and donor windows for donor-side effect estimation and DBW
+Z_tgt_pkg <- slice_around(Z_infl, target_day, pre = pre_tgt, post = 0L)
+shock_time_tgt_local <- pre_tgt + 1L
+
+Z_don_list <- lapply(
+  donor_effect_days,
+  function(d) slice_around(Z_infl, d, pre = pre_don, post = post_don)
+)
+shock_time_don_local <- pre_don + 1L
+
+Y_series_list <- c(
+  list(Z_tgt_pkg[, "AAPL", drop = FALSE]),
+  lapply(Z_don_list, function(zz) zz[, "AAPL", drop = FALSE])
+)
+
+X_for_dbw <- c(
+  list(Z_tgt_pkg[, c("GSPC", "IRX"), drop = FALSE]),
+  lapply(Z_don_list, function(zz) zz[, c("GSPC", "IRX"), drop = FALSE])
+)
+
+shock_time_vec   <- c(shock_time_tgt_local, rep(shock_time_don_local, length(Z_don_list)))
+shock_length_vec <- rep(Ls, length(Y_series_list))
+
+# Use SynthPrediction only for donor-side shock effects and DBW weights
+out_pkg <- SynthPrediction(
+  Y_series_list = Y_series_list,
+  covariates_series_list = X_for_dbw,
+  shock_time_vec = shock_time_vec,
+  shock_length_vec = shock_length_vec,
+  k = 1,
+  use_dbw = TRUE,
+  dbw_indices = 1:2,
+  covariate_indices = NULL,
+  arima_order = NULL,
+  seasonal = FALSE,
+  control_shocks = NULL,
+  dbw_center = TRUE,
+  dbw_scale = TRUE,
+  days_before_shocktime_vec = 10L,
+  plots = FALSE
+)
+
+w_hat          <- as.numeric(out_pkg$meta$weights)
+omega_vec      <- as.numeric(out_pkg$meta$omega_vec)
+omega_combined <- as.numeric(out_pkg$meta$combined_omega)
+
+# Build the one-step target baseline using the observed 2020-11-10 close
+Z_tgt_base <- slice_around(Z_infl, last_obs_day, pre = pre_tgt, post = 0L)
+n_base <- nrow(Z_tgt_base)
+
+train_dat <- data.frame(
+  Y    = as.numeric(Z_tgt_base[2:n_base, "AAPL"]),
+  lagY = as.numeric(Z_tgt_base[1:(n_base - 1), "AAPL"]),
+  GSPC = as.numeric(Z_tgt_base[1:(n_base - 1), "GSPC"]),
+  IRX  = as.numeric(Z_tgt_base[1:(n_base - 1), "IRX"])
+)
+
+# Add the control-shock regressor using the package helper
+idx_ctrl <- which(as.Date(index(Z_tgt_base))[1:(n_base - 1)] == control_shock_day)
+
+C_train <- build_control_xreg(
+  last = nrow(train_dat),
+  control_spec = list(
+    list(time = as.integer(idx_ctrl), length = 1L, shape = "point")
+  )
+)
+
+train_dat <- cbind(train_dat, as.data.frame(C_train))
+
+fit_base <- lm(Y ~ lagY + GSPC + IRX + ctrl_shock_1, data = train_dat)
+
+# One-step forecast for 2020-11-11 using the observed 2020-11-10 values
+newdata_1110 <- data.frame(
+  lagY = as.numeric(Z_tgt_base[n_base, "AAPL"]),
+  GSPC = as.numeric(Z_tgt_base[n_base, "GSPC"]),
+  IRX  = as.numeric(Z_tgt_base[n_base, "IRX"]),
+  ctrl_shock_1 = 0
+)
+
+yhat_base <- as.numeric(predict(fit_base, newdata = newdata_1110))
+
+# Apply donor-side adjustments
+yhat_dbw   <- yhat_base + omega_combined
+yhat_equal <- yhat_base + mean(omega_vec)
+
+# Observed target value on 2020-11-11
+truth_idx <- which(as.Date(index(Z_infl)) == target_day)
+y_true <- as.numeric(Z_infl[truth_idx, "AAPL"])
+
+# Final comparison table
+res <- data.frame(
+  Method = c("Baseline one-step", "Baseline + DBW adjustment", "Baseline + mean adjustment", "Truth"),
+  Value  = c(yhat_base, yhat_dbw, yhat_equal, y_true)
+)
+
+# Absolute error table
+err <- data.frame(
+  Method = c("Baseline one-step", "Baseline + DBW adjustment", "Baseline + mean adjustment"),
+  AbsErr = c(abs(yhat_base - y_true),
+             abs(yhat_dbw - y_true),
+             abs(yhat_equal - y_true))
+)
+
+knitr::kable(
+  res,
+  digits = 4,
+  caption = "Forecast comparison for the Apple one-step control-shock experiment."
+)
+
+knitr::kable(
+  err,
+  digits = 4,
+  caption = "Absolute forecast errors for the Apple one-step control-shock experiment."
+)
+```
+
+```{r}
+# data-raw/make_aapl_onestep_input.R
+
+
+aapl_onestep_input <- list(
+  Y_series_list = Y_series_list,
+  X_for_dbw = X_for_dbw,
+  shock_time_vec = shock_time_vec,
+  shock_length_vec = shock_length_vec,
+  Z_tgt_base = Z_tgt_base,
+  control_shock_day = control_shock_day,
+  target_day = target_day,
+  last_obs_day = last_obs_day,
+  donor_effect_days = donor_effect_days,
+  release_day = release_day
+)
+
+usethis::use_data(aapl_onestep_input, overwrite = TRUE)
+
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(xts)
+  library(forecast)
+})
+
+# ---- inputs ----
+shock_day <- as.Date("2020-11-10")
+pre <- 200L   
+dates <- as.Date(index(Z_infl))
+idx <- which(dates == shock_day)
+stopifnot(length(idx) == 1L)
+
+ 
+a <- idx - pre
+b <- idx
+stopifnot(a >= 1)
+
+win <- Z_infl[a:b, c("AAPL","GSPC","IRX"), drop = FALSE]
+
+# ---- build ARX(1) training data: y_t ~ y_{t-1} + x_{t-1} ----
+y  <- as.numeric(win$AAPL)
+x  <- as.matrix(win[, c("GSPC","IRX")])
+
+# lag-1 (xreg at t-1)
+y_lag <- y[-length(y)]
+y_cur <- y[-1]
+
+x_lag <- x[-NROW(x), , drop = FALSE]   # aligns with y_cur
+
+# ---- fit ARX(1): ARIMA(1,0,0) with xreg = lagged covariates ----
+fit <- forecast::Arima(
+  y_cur,
+  order = c(1,0,0),
+  xreg  = x_lag,
+  method = "ML",          # 避免 CSS 那个 non-stationary 报错
+  transform.pars = FALSE  # 更稳
+)
+
+# ---- 1-step forecast: need next xreg (use last available lagged covariates) ----
+x_next <- matrix(x[NROW(x), ], nrow = 1)   # x_{T} 作为 forecast 时刻的 xreg（因为我们用的是 lag-1）
+colnames(x_next) <- colnames(x_lag)
+
+fc <- forecast::forecast(fit, h = 1, xreg = x_next)
+yhat_arx <- as.numeric(fc$mean)
+
+# ---- ground truth (shock 后一天) ----
+y_true <- as.numeric(Z_infl[idx + 1, "AAPL"])
+
+cat("\n=== Pure ARX(1) unadjusted baseline ===\n")
+cat("shock day:", as.character(shock_day), "\n")
+cat("predict day:", as.character(dates[idx+1]), "\n")
+cat("yhat_arx =", yhat_arx, "\n")
+cat("y_true   =", y_true, "\n")
+cat("abs err  =", abs(yhat_arx - y_true), "\n")
+
+
+suppressPackageStartupMessages({
+  library(quantmod)
+  library(xts)
+})
+
+# ============================================================
+# Teacher-style UNADJUSTED baseline (Apple case)
+# - Local 25 trading-day window ending at T* (= 2020-11-09)
+# - ARX(1) implemented as linear regression:
+#     y_t = b0 + b1*y_{t-1} + b2*GSPC_t + b3*IRX_t + b4*shock_dummy_t + e_t
+# - Unadjusted forecast = 2-step recursion to y_{T*+2} (2020-11-11)
+# - Shock dummy is set to 0 in forecasting (unadjusted).
+# - IMPORTANT: This is NOT your package; it's a clean baseline to compare against.
+# ============================================================
+
+# ---- assumes you already have Z_infl (xts) with cols: AAPL, GSPC, IRX ----
+stopifnot(exists("Z_infl"))
+stopifnot(all(c("AAPL","GSPC","IRX") %in% colnames(Z_infl)))
+
+# ---- teacher's reference T* and evaluation at T*+2 ----
+Tstar_day <- as.Date("2020-11-09")   # T1*
+h         <- 2L                      # forecast to T*+2
+window_n  <- 25L                     # local window length used in the paper code
+
+dates <- as.Date(index(Z_infl))
+idx_T <- which(dates == Tstar_day)
+stopifnot(length(idx_T) == 1L)
+
+# need enough history and horizon
+stopifnot(idx_T - (window_n - 1) >= 2L)     # need lag
+stopifnot(idx_T + h <= NROW(Z_infl))        # need future truth and covariates
+
+# ------------------------------------------------------------
+# 1) Build TS1 window: 25 days ending at T*
+# ------------------------------------------------------------
+win_idx <- (idx_T - (window_n - 1)) : idx_T
+TS1 <- Z_infl[win_idx, c("AAPL","GSPC","IRX")]
+
+# ------------------------------------------------------------
+# 2) Create lagged response regression dataset
+#    y_t uses covariates at time t, and lagged AAPL at t-1
+# ------------------------------------------------------------
+# y_t (current)
+y  <- as.numeric(TS1$AAPL)
+
+# y_{t-1} (lag)
+y_lag <- c(NA, y[-length(y)])
+
+# covariates at time t
+gspc <- as.numeric(TS1$GSPC)
+irx  <- as.numeric(TS1$IRX)
+
+# shock dummy in their TS1 code: they used 2020-10-09 as "obs.shock"
+# (keep it exactly as teacher code; doesn't affect unadjusted forecast when set to 0)
+obs_shock_day <- as.Date("2020-10-09")
+shock_dummy <- as.numeric(as.Date(index(TS1)) == obs_shock_day)
+
+# assemble data frame, drop first row due to lag NA
+dat <- data.frame(
+  y = y,
+  y_lag = y_lag,
+  gspc = gspc,
+  irx  = irx,
+  shock = shock_dummy
+)
+dat_fit <- dat[-1, , drop = FALSE]
+
+# ------------------------------------------------------------
+# 3) Fit ARX(1) via lm (teacher-style)
+# ------------------------------------------------------------
+fit <- lm(y ~ y_lag + gspc + irx + shock, data = dat_fit)
+
+# ------------------------------------------------------------
+# 4) 2-step recursive UNADJUSTED forecast to T*+2
+#    Need covariates for t=T*+1 and t=T*+2 (use realized X like teacher)
+# ------------------------------------------------------------
+X_next <- Z_infl[(idx_T + 1):(idx_T + h), c("GSPC","IRX")]
+gspc_next <- as.numeric(X_next$GSPC)
+irx_next  <- as.numeric(X_next$IRX)
+
+b <- coef(fit)
+
+# step 1: forecast y_{T*+1}
+y_T <- as.numeric(Z_infl[idx_T, "AAPL"])
+yhat_1 <- as.numeric(b["(Intercept)"] +
+                       b["y_lag"] * y_T +
+                       b["gspc"]  * gspc_next[1] +
+                       b["irx"]   * irx_next[1] +
+                       b["shock"] * 0)
+
+# step 2: forecast y_{T*+2} using yhat_1 as lag
+yhat_2 <- as.numeric(b["(Intercept)"] +
+                       b["y_lag"] * yhat_1 +
+                       b["gspc"]  * gspc_next[2] +
+                       b["irx"]   * irx_next[2] +
+                       b["shock"] * 0)
+
+# ------------------------------------------------------------
+# 5) Ground truth and print
+# ------------------------------------------------------------
+y_true <- as.numeric(Z_infl[idx_T + h, "AAPL"])
+
+cat("\n=== Teacher-style UNADJUSTED (ARX(1) via lm) ===\n")
+cat("T* day         :", as.character(Tstar_day), "\n")
+cat("Predict day    :", as.character(dates[idx_T + h]), " (T*+2)\n")
+cat("Window length  :", window_n, "trading days (ending at T*)\n")
+cat("yhat(T*+1)     :", sprintf("%.6f", yhat_1), "\n")
+cat("yhat(T*+2)     :", sprintf("%.6f", yhat_2), "\n")
+cat("y_true(T*+2)   :", sprintf("%.6f", y_true), "\n")
+cat("abs err (T*+2) :", sprintf("%.6f", abs(yhat_2 - y_true)), "\n")
+
+# Optional: inspect coefficients
+cat("\n--- lm coefficients ---\n")
+print(coef(summary(fit)))
+
+
+```

@@ -1,0 +1,416 @@
+---
+title: "sim_vol_tets"
+author: "Qiyang Wang"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    toc_depth: 4
+urlcolor: blue
+---
+
+##test for auto
+```{r, message=FALSE, warning=FALSE,echo=FALSE}
+# --- Dependencies -------------------------------------------------------------
+library(postshock)
+
+# --- 1) Simulate an sGARCH(1,1) series --------------------------------------
+# We generate y_t = sigma_t * eps_t, with
+#   sigma_t^2 = omega + alpha * y_{t-1}^2 + beta * sigma_{t-1}^2
+# Choice of parameters (omega, alpha, beta) ensures stationarity (alpha + beta < 1).
+set.seed(123)
+n      <- 2000
+omega  <- 0.05
+alpha  <- 0.07
+beta   <- 0.90
+stopifnot(alpha + beta < 1)          # stationarity check
+
+eps    <- rnorm(n)
+sigma2 <- numeric(n)
+y      <- numeric(n)
+
+# Initialize with the unconditional variance for faster stabilization.
+sigma2[1] <- omega / (1 - alpha - beta)
+y[1]      <- sqrt(sigma2[1]) * eps[1]
+
+for (t in 2:n) {
+  sigma2[t] <- omega + alpha * y[t-1]^2 + beta * sigma2[t-1]
+  y[t]      <- sqrt(sigma2[t]) * eps[t]
+}
+
+# --- 2) Run your auto_garchx order selection ---------------------------------
+# search_o = c(0L,1L) means: try symmetric GARCH (o=0) and GJR-GARCH (o=1).
+# final_refit = TRUE triggers a refit using a backcast set to the unconditional variance
+# (clamped to a reasonable range), which often improves BIC stability.
+best <- auto_garchx(
+  y,
+  max.p       = 3,
+  max.q       = 3,
+  search_o    = c(0L, 1L),
+  final_refit = TRUE,
+  vcov.type   = "robust",   # robust (sandwich) covariance for standard errors
+  verbose     = TRUE
+)
+
+# --- 3) Inspect the selected specification and estimates ---------------------
+# NOTE: garchx uses order = c(q, p, o) internally; the helper returns p, q, o separately.
+best$p; best$q; best$o            # Expect something close to p=1, q=1, o=0 for this DGP
+best$bic; best$aic                # Information criteria of the selected fit
+
+# Model coefficients (intercept/omega, ARCH terms, GARCH terms, and possibly asymmetry)
+coef(best$fit)
+
+# Conditional variance and standard deviation (first few values)
+head(fitted(best$fit))            # sigma_t^2
+head(sqrt(fitted(best$fit)))      # sigma_t
+
+# Model residuals (innovations)
+head(residuals(best$fit))
+
+# --- 4) Variance forecasts ----------------------------------------------------
+# Predict conditional variance k steps ahead (returns a numeric vector).
+predict(best$fit, n.ahead = 5)
+
+```
+
+
+```{r, message=FALSE, warning=FALSE,echo=FALSE}
+library(garchx)
+
+## 1) Data generator: GJR-GARCH(1,1) -----------------------------------------
+# Recursion:
+#   h_t = ω + α ε_{t-1}^2 + γ * 1{ε_{t-1}<0} * ε_{t-1}^2 + β h_{t-1}
+#   ε_t = sqrt(h_t) * z_t ,  z_t ~ N(0,1)
+# Returns both the simulated returns y and the true conditional variance h_true.
+sim_gjr <- function(n = 3000, burnin = 800,
+                    omega = 0.02, alpha = 0.07, beta = 0.80, gamma = 0.25) {
+  # Stationarity check for GJR: alpha + beta + 0.5*gamma < 1
+  stopifnot(alpha + beta + 0.5 * gamma < 1)
+
+  N <- n + burnin                     # simulate extra for burn-in stabilization
+  z <- rnorm(N)                       # i.i.d. standard normal shocks
+  e <- numeric(N)                     # returns/innovations (ε_t)
+  h <- numeric(N)                     # conditional variance (h_t)
+
+  # Initialize at the unconditional variance (fast stabilization)
+  h[1] <- omega / (1 - alpha - beta - 0.5 * gamma)
+  e[1] <- sqrt(h[1]) * z[1]
+
+  # Forward recursion
+  for (t in 2:N) {
+    Ineg <- as.numeric(e[t - 1] < 0)  # indicator for negative shock (GJR term)
+    h[t] <- omega +
+      alpha * e[t - 1]^2 +
+      gamma * Ineg * e[t - 1]^2 +
+      beta  * h[t - 1]
+    e[t] <- sqrt(h[t]) * z[t]
+  }
+
+  # Drop burn-in and return last n points
+  list(y = tail(e, n), h_true = tail(h, n))
+}
+
+## 2) One run with fixed seed; full order search (max.p = max.q = 3) ----------
+set.seed(4242)
+sim   <- sim_gjr(n = 3000, omega = 0.02, alpha = 0.07, beta = 0.80, gamma = 0.25)
+y     <- sim$y
+vtrue <- sim$h_true                        # ground-truth conditional variance
+
+# Automatic model selection using your helper:
+# - tries a grid over p in [0..max.p], q in [0..max.q], o in {0 (sGARCH), 1 (GJR)}
+# - picks the best by BIC, then optionally refits with a backcast heuristic
+best <- auto_garchx(
+  y          = y,
+  max.p      = 3,
+  max.q      = 3,               # fairly small grid; expand if needed
+  search_o   = c(0L, 1L),       # allow symmetric (o=0) and GJR (o=1)
+  final_refit = TRUE,           # refit with backcast for stability
+  vcov.type  = "robust",        # robust (sandwich) covariance for SEs
+  verbose    = TRUE
+)
+
+cat(sprintf("\nSelected (q,p,o) = (%d,%d,%d)\n", best$q, best$p, best$o))
+print(coef(best$fit))
+
+## 3) Extract fitted conditional variance and compare to truth -----------------
+# garchx::fitted() may return a vector or a matrix; select the variance column.
+ff <- fitted(best$fit)
+
+vhat <- as.numeric(
+  if (is.matrix(ff)) {
+    cn  <- tolower(colnames(ff))
+    idx <- which(cn %in% c("sigma2", "variance", "var", "h", "cond.h", "condh"))
+    if (length(idx)) ff[, idx[1]] else ff[, ncol(ff)]  # fallback to last column
+  } else ff
+)
+
+# Compare over the overlapping tail (e.g., last 100 points).
+# If series are shorter than 100, fall back to the minimum available length.
+L <- min(100, length(vhat), length(vtrue))
+vhat_L  <- tail(vhat,  L)
+vtrue_L <- tail(vtrue, L)
+
+# Simple diagnostics: MSE and correlation between fitted and true variance
+mse  <- mean((vhat_L - vtrue_L)^2)
+corr <- cor(vhat_L, vtrue_L)
+cat(sprintf("Last-%d  MSE = %.6f | Corr = %.3f\n", L, mse, corr))
+
+# Visualization: ground-truth vs fitted conditional variance on the tail window
+plot(vtrue_L, type = "l", lwd = 1.6, col = "blue",
+     main = sprintf("True vs Fitted variance (last %d)", L),
+     xlab = "t (tail)", ylab = "variance")
+lines(vhat_L,  lwd = 1.2, col = "red")
+legend("topright", c("true", "fitted"), lty = 1, lwd = c(1.6, 1.2),
+       col = c("blue", "red"), bty = "n")
+
+```
+## Test the SynthVolForecast function
+### First round of testing-for this moudel without donors
+```{r, message=FALSE, warning=FALSE,echo=FALSE}
+
+# simulate GJR-GARCH(1,1)
+sim_gjr <- function(n=2000, omega=0.02, alpha=0.07, beta=0.80, gamma=0.25) {
+  stopifnot(alpha + beta + 0.5*gamma < 1)
+  z <- rnorm(n); h <- e <- numeric(n)
+  h[1] <- omega/(1 - alpha - beta - 0.5*gamma); e[1] <- sqrt(h[1]) * z[1]
+  for (t in 2:n) {
+    Ineg <- as.numeric(e[t-1] < 0)
+    h[t] <- omega + alpha*e[t-1]^2 + gamma*Ineg*e[t-1]^2 + beta*h[t-1]
+    e[t] <- sqrt(h[t]) * z[t]
+  }
+  list(y = e, h = h)
+}
+
+set.seed(1)
+n   <- 2000
+dat <- sim_gjr(n)
+y   <- dat$y
+h   <- dat$h
+
+#parameters for SynthVolForecast
+shock_time   <- 1500
+shock_length <- 1     # 占位
+k            <- 3     # 想测几步就改几步
+
+Y_series_list          <- list(y)          # only target, no donors
+covariates_series_list <- list()           # no donor
+target_covariates      <- data.frame(const = rep(1, n))  #  only intercept
+
+# true future variance and future squared returns
+true_var_k <- h[(shock_time+1):(shock_time+k)]
+y2_future  <- y[(shock_time+1):(shock_time+k)]^2
+
+ 
+res_k <- SynthVolForecast(
+  Y_series_list          = Y_series_list,
+  covariates_series_list = covariates_series_list,
+  target_covariates      = target_covariates,
+  shock_time_vec         = c(shock_time),
+  shock_length_vec       = c(shock_length),
+  k                      = k,
+  covariate_indices      = NULL,     #  GARCH
+  max.p = 3, max.q = 3,
+  plots = FALSE
+)
+
+pred_k <- res_k$predictions$unadjusted
+pred_k <- pmax(1e-10, pred_k)  
+
+ 
+mse_k   <- mean((pred_k - true_var_k)^2)
+corr_k  <- suppressWarnings(cor(pred_k, true_var_k))
+qlike_k <- mean(log(pred_k) + y2_future / pred_k)
+
+cat(sprintf("Single-origin %d-step: MSE(true)=%.6f | Corr(true)=%.3f | QLIKE=%.6f\n",
+            k, mse_k, corr_k, qlike_k))
+
+op <- par(no.readonly = TRUE); on.exit(par(op))
+yl <- range(c(true_var_k, pred_k), finite = TRUE)   
+plot(seq_len(k), true_var_k, type="l", lwd=2, col="black",
+     main=sprintf("True vs Predicted var (k=%d)", k),
+     xlab="horizon", ylab="variance", ylim = yl)
+lines(seq_len(k), pred_k, lwd=2, lty=2, col="red")
+points(seq_len(k), pred_k, pch=16, col="red")
+legend("topleft", c("true","pred"), col=c("black","red"), lty=c(1,2), lwd=2, bty="n")
+```
+
+```{r, message=FALSE, warning=FALSE,echo=FALSE}
+# ====== Dependencies ======
+library(garchx)
+library(zoo)
+
+# ====== 1) Simulation: GJR-GARCH(1,1) with an ω-jump ======
+# d_omega > 0 means the constant term ω is increased after t0 (i.e., a level shift in variance)
+sim_gjr_omega_jump <- function(n, t0,
+                               omega = 0.02, d_omega = 0.06,
+                               alpha = 0.07, beta = 0.80, gamma = 0.25,
+                               seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  stopifnot(alpha + beta + 0.5 * gamma < 1)      # stationarity check
+
+  z <- rnorm(n)                                  # i.i.d. N(0,1)
+  h <- e <- numeric(n)
+
+  # Warm start using the unconditional variance under the pre-jump ω
+  h[1] <- omega / (1 - alpha - beta - 0.5 * gamma)
+  e[1] <- sqrt(h[1]) * z[1]
+
+  for (t in 2:n) {
+    # Use ω + d_omega after the shock time; ω otherwise
+    omega_t <- if (t > t0) omega + d_omega else omega
+    Ineg    <- as.numeric(e[t - 1] < 0)          # GJR indicator for negative shocks
+
+    # Conditional variance recursion
+    h[t] <- omega_t +
+            alpha * e[t - 1]^2 +
+            gamma * Ineg * e[t - 1]^2 +
+            beta  * h[t - 1]
+
+    # Return (innovation) with conditional std dev
+    e[t] <- sqrt(h[t]) * z[t]
+  }
+  list(y = e, h = h)                             # y = returns; h = true variance
+}
+
+# ====== 2) DBW-only feature construction from y (no covariates into GARCH) ======
+# These features are used only by DBW to compute donor weights (covariate_indices = NULL below)
+make_dbw_features <- function(y, L = 10) {
+  v2 <- y^2
+
+  # Rolling second moments (partial = TRUE avoids NA prefixes)
+  msq5  <- rollapplyr(v2,  5, mean, partial = TRUE)
+  msq10 <- rollapplyr(v2, 10, mean, partial = TRUE)
+  msq20 <- rollapplyr(v2, 20, mean, partial = TRUE)
+
+  # Rolling volatility
+  vol10 <- rollapplyr(y, 10, sd, partial = TRUE)
+
+  # “Shape expansion” of the most recent L lags of y^2
+  lag_one <- function(x, k) { if (k == 0) x else c(rep(x[1], k), x[1:(length(x) - k)]) }
+  lag_block <- sapply(0:(L - 1), function(k) lag_one(v2, k))
+  colnames(lag_block) <- paste0("v2_lag", 0:(L - 1))
+
+  as.data.frame(cbind(msq5, msq10, msq20, vol10, lag_block))
+}
+
+# ====== 3) Generate target + 3 donors (same t0, different jump sizes) ======
+set.seed(2025)
+n  <- 1600
+t0 <- 1200
+
+# target: medium jump; donors: strong / medium / weak jumps
+tar <- sim_gjr_omega_jump(n, t0, d_omega = 0.06)
+d1  <- sim_gjr_omega_jump(n, t0, d_omega = 0.08)
+d2  <- sim_gjr_omega_jump(n, t0, d_omega = 0.04)
+d3  <- sim_gjr_omega_jump(n, t0, d_omega = 0.02)
+
+Y_series_list <- list(tar$y, d1$y, d2$y, d3$y)
+
+# — Build DBW features for target + donors (used only for weighting) —
+target_covariates      <- make_dbw_features(tar$y, L = 10)
+covariates_series_list <- lapply(Y_series_list[-1], make_dbw_features, L = 10)
+
+# ====== 4) Shock metadata ======
+# Persistent ω-jump: indicator stays 1 from t0+1 to the end of the sample
+permanent_jump <- TRUE
+if (permanent_jump) {
+  shock_time_vec <- rep(as.integer(t0), length(Y_series_list))
+  shock_length_vec <- vapply(
+    Y_series_list,
+    function(y) pmax(1L, as.integer(length(y) - as.integer(t0))),  # run to the end
+    integer(1L)
+  )
+} else {
+  # Transient shock (example): here you could set different finite lengths
+  shock_time_vec <- rep(as.integer(t0), length(Y_series_list))
+  shock_length_vec <- vapply(
+    Y_series_list,
+    function(y) pmax(1L, as.integer(length(y) - as.integer(t0))),  # placeholder
+    integer(1L)
+  )
+}
+
+# ====== 5) Single test wrapper: call SynthVolForecast and compare to truth ======
+run_once <- function(k) {
+  stopifnot(k >= 1, k == as.integer(k))
+
+  # Call your SynthVolForecast:
+  # - Feed DBW with features (no covariates into GARCH; covariate_indices = NULL)
+  # - Use all columns from target_covariates for DBW
+  res <- SynthVolForecast(
+    Y_series_list          = Y_series_list,
+    covariates_series_list = covariates_series_list,     # donor features (for DBW)
+    target_covariates      = target_covariates,          # target features (for DBW)
+    shock_time_vec         = shock_time_vec,
+    shock_length_vec       = shock_length_vec,
+    k                      = k,
+    dbw_indices            = 1:ncol(target_covariates),  # columns used by DBW
+    covariate_indices      = NULL,                       # ⭐ keep GARCH free of xreg
+    max.p = 3, max.q = 3,
+    plots = FALSE
+  )
+
+  # — Compare adjusted prediction vs true variance over k steps after t0 —
+  pred_adj <- as.numeric(res$predictions$adjusted)       # includes synthetic donor correction
+  pred_raw <- as.numeric(res$predictions$unadjusted)     # plain GARCH prediction
+  truev    <- tar$h[(t0 + 1):(t0 + k)]                   # simulated ground truth variance
+
+  # Basic metrics
+  mse_adj  <- mean((pred_adj - truev)^2)
+  mae_adj  <- mean(abs(pred_adj - truev))
+  corr_adj <- if (k > 1) suppressWarnings(cor(pred_adj, truev)) else NA_real_
+
+  # Step-by-step table for quick inspection
+  tab <- data.frame(
+    step            = seq_len(k),
+    true_var        = truev,
+    pred_raw        = pred_raw,
+    pred_adj        = pred_adj,
+    diff_adj        = pred_adj - truev,
+    abs_pct_err_adj = 100 * abs(pred_adj - truev) / truev
+  )
+  tab[] <- lapply(tab, function(x) if (is.numeric(x)) round(x, 6) else x)
+  print(tab, row.names = FALSE)
+
+  cat(sprintf(
+    "\n[k=%d]  MSE(true, adj)=%.6f | MAE=%.6f | Corr=%s\n",
+    k, mse_adj, mae_adj, if (is.na(corr_adj)) "NA" else sprintf("%.3f", corr_adj)
+  ))
+
+  # — Show DBW weights and each donor’s estimated shock effect —
+  cat("weights (w_hat): ", paste(round(res$meta$weights, 3), collapse = ", "), "\n")
+  cat("omega by donor : ", paste(round(res$meta$omega_vec, 3), collapse = ", "), "\n")
+  cat("combined omega : ", round(res$meta$combined_omega, 3), "\n\n")
+
+  # — Mini plot (even k = 1 shows points) —
+  x <- seq_len(k)
+  ylim <- range(c(truev, pred_adj, pred_raw), finite = TRUE)
+  plot(x, truev,
+       type = if (k > 1) "l" else "p", pch = 19,
+       lwd = 2, col = "black",
+       main = sprintf("True vs Predicted variance (k=%d)", k),
+       xlab = "horizon (step)", ylab = "variance",
+       ylim = ylim)
+  lines(x, pred_adj, lwd = 2, col = "red",  lty = 2)
+  if (k == 1) points(x, pred_adj, pch = 17, col = "red",   cex = 1.1)
+  lines(x, pred_raw, lwd = 1, col = "grey40", lty = 3)
+  if (k == 1) points(x, pred_raw, pch = 15, col = "grey40", cex = 1.1)
+  legend("topleft",
+         c("true", "pred (adjusted)", "pred (raw)"),
+         lwd = c(2, 2, 1), lty = c(1, 2, 3),
+         pch = c(19, if (k == 1) 17 else NA, if (k == 1) 15 else NA),
+         col = c("black", "red", "grey40"), bty = "n")
+
+  invisible(list(
+    res     = res,
+    table   = tab,
+    metrics = list(mse = mse_adj, mae = mae_adj, corr = corr_adj)
+  ))
+}
+
+cat("=== ω-jump: single-origin testing (k = 1–2) ===\n")
+res_k1 <- run_once(k = 1)
+res_k2 <- run_once(k = 2)
+
+```

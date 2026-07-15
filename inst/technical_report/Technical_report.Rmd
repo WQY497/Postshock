@@ -1,0 +1,2597 @@
+---
+title: "Donor-Based Post-Shock Forecasting for Mean and Volatility Dynamics"
+author: "Qiyang Wang"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    number_sections: yes
+    toc: true
+fontsize: 11pt
+geometry: margin=1in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 6.5,
+  fig.height = 4
+)
+
+
+library(tidyverse)
+library(lubridate)
+devtools::load_all("..")
+
+```
+
+# Abstract
+
+Forecasts based only on pre-shock observations can perform poorly when a time series is hit by a large structural shock. This problem is especially relevant in financial applications, where abrupt events may affect both the conditional mean and the conditional variance of the target series. We propose a donor-based post-shock forecasting framework that uses historical shock episodes from related series to adjust forecasts after a new shock occurs.
+
+The framework combines two forecasting modules with a common donor-weighting step. For conditional mean forecasting, donor-specific shock effects are estimated using ARIMA or ARIMAX models and then aggregated using donor balancing weights constructed from pre-shock covariates. For conditional volatility forecasting, the same idea is extended to GARCH-X models: donor-specific post-shock variance effects are estimated from historical shock episodes and transferred to the target’s baseline pre-shock GARCH variance forecast. In both settings, the weighting step gives more influence to donor episodes that more closely resemble the target before the shock.
+
+The framework also includes two extensions for more complex empirical settings. A multi-pool structure allows donors to be grouped into interpretable shock channels before aggregation, while a control-shock specification incorporates additional known events as structured regressors. Simulation studies show that the donor-adjusted forecasts can improve on unadjusted ARIMA and GARCH-type baselines when the target undergoes a post-shock shift. Empirical applications to ConocoPhillips during the March 2020 oil-market collapse, IYG volatility around the 2016 U.S. election, and an Apple control-shock example illustrate the use of the framework for mean forecasting, volatility forecasting, and control-shock analysis in financial data. The full workflow is implemented in the `postshock` R package and is designed to support reproducible empirical analysis.
+
+# Introduction
+
+## Motivation
+
+Time series observed in economics, finance, environmental science, and related fields often experience large shocks. These shocks may come from policy announcements, supply disruptions, financial crises, geopolitical events, or sudden changes in demand. When such events occur, the pattern learned from pre-shock data may no longer describe the post-shock period well. A model fitted only to the pre-shock observations may therefore continue the old pattern into a new regime and produce biased forecasts.
+
+This problem appears in both mean forecasting and volatility forecasting. In mean forecasting, a shock may cause a sudden level shift or a persistent change in the target trajectory. In volatility forecasting, the same shock may change the size, persistence, or clustering of future fluctuations. For example, a market event may not only move the expected return or price level of an asset, but also increase the uncertainty around future movements. A useful post-shock forecasting framework should therefore be able to handle both the conditional mean and the conditional variance.
+
+In many empirical applications, the analyst often has access to more than the target series alone. Historical episodes from related series are often available, and some of these episodes may have experienced similar shocks in the past. These historical episodes can serve as donors. The basic idea is to estimate how donors responded after their own shocks and then use this information to adjust the forecast for the new target shock. The challenge is that donors are not equally useful. Some donors may look similar to the target before the shock, while others may differ substantially in their pre-shock behavior or covariate environment. A simple average of all donor effects can therefore be unstable or misleading.
+
+## Overview of the framework
+
+This report develops a donor-based post-shock forecasting framework built around donor balancing weights. The framework first compares the target and donor episodes using information available before the shock. It then assigns larger weights to donors that are more similar to the target and uses the weighted donor effects to adjust the target forecast. In this way, the adjustment is not based on all donors equally, but on a synthetic donor combination designed to match the target more closely in the pre-shock period.
+
+The donor-weighting step is implemented through `dbw()`. This component is model-agnostic: it constructs weights from pre-shock covariates and can, in principle, be combined with different baseline forecasting models. In the current implementation, these weights are used in two main forecasting modules. The first module, `SynthPrediction()`, focuses on post-shock mean forecasting. It estimates donor-specific shock effects using ARIMA or ARIMAX models with post-shock indicators, combines those effects using the donor balancing weights, and adds the resulting adjustment to the target baseline forecast.
+
+The second module, `SynthVolForecast()`, applies the same donor-adjustment idea to volatility forecasting. Instead of estimating post-shock changes in the conditional mean, this module estimates post-shock changes in the variance equation. For each donor episode, a GARCH-X model is fitted with a post-shock indicator, and the coefficient on this indicator is treated as the donor-specific volatility adjustment. The helper function `auto_garchx()` provides a systematic way to select GARCH-X specifications when the order is not supplied by the user. These donor-specific variance adjustments are then combined using the donor balancing weights and added to the target’s baseline pre-shock GARCH-family variance forecast. This gives a parallel workflow for adjusting the target’s post-shock variance forecast using historical donor episodes.
+
+The framework also includes two extensions that are currently implemented mainly in the mean-forecasting workflow. First, the multi-pool extension allows donors to be grouped into interpretable categories before aggregation. For example, in an energy-market application, one may separate supply-related and demand-related donor shocks. Shock effects are first combined within each pool and then aggregated across pools. Second, the control-shock extension allows additional known events in the target window to be included as structured regressors. This is useful when the observed post-shock movement may reflect both the main shock of interest and other known events.
+
+## Contributions and relation to existing work
+
+This report builds on the post-shock adjustment idea of Lin and Eck (2021). Their work studies the problem of forecasting a target series immediately after a structural shock by borrowing information from historical donor episodes whose post-shock outcomes are already observed. They propose several shock-effect aggregation estimators, including simple averaging, inverse-variance weighting, and similarity weighting, and analyze when these adjustments can reduce forecast risk. Their empirical examples focus on post-shock stock-price forecasting for ConocoPhillips and Apple in an autoregressive mean-forecasting setting.
+
+The present work takes this idea as a starting point and develops it into a broader and reusable implementation. First, we implement donor balancing weights as a general weighting layer through `dbw()`, so that donor weights can be constructed from pre-shock covariates and reused across different forecasting modules. Second, we wrap the donor-adjustment workflow into `SynthPrediction()`, which supports ARIMA and ARIMAX baselines for post-shock mean forecasting. Third, we extend the same donor-adjustment logic to volatility forecasting through `SynthVolForecast()`, where donor-specific post-shock effects are estimated in a GARCH-X variance equation. Finally, we add multi-pool aggregation and control-shock specifications to handle more structured empirical settings.
+
+The resulting `postshock` package is therefore not intended to replace the original post-shock adjustment idea, but to operationalize and extend it. The ConocoPhillips case study serves as a benchmark linked to the original application, while the IYG volatility and Apple control-shock examples illustrate additional directions made possible by the package implementation.
+
+## Roadmap
+
+The remainder of the report is organized as follows. Section 3 introduces the problem setup, notation, and methodological components of the framework. Section 4 describes the data objects and empirical setup used in the applications. Section 5 presents simulation studies for both mean and volatility forecasting. Section 6 presents empirical applications of the mean-forecasting module using ConocoPhillips, including the baseline single-pool specification and the MultiPool extension. Section 7 presents a real-data volatility forecasting application using `SynthVolForecast()` for IYG around the 2016 U.S. election. Section 8 gives an Apple control-shock extension. Section 9 concludes.
+
+# Methodology and Implementation
+
+## Problem setup and notation
+
+The primary objective of the `postshock` package is to address the failure of traditional forecasting models in the presence of **substantial structural shocks**. Under such "big shocks," baseline models (like ARIMA or GARCH) estimated on pre-shock data typically suffer from severe bias as the underlying data-generating process undergoes a radical shift. Our framework leverages a **donor-based counterfactual approach** to adjust these forecasts by borrowing "shock signatures" from historical donor episodes.
+
+### Regime Boundaries and Timing
+
+We consider a target time series $Y_{0,t}$ and $J$ donor series $Y_{j,t}$. We model the shock not as a point-event, but as a **regime shift**—a transition from a stable baseline to a post-shock state. 
+
+To facilitate the donor-based adjustment, all series are aligned relative to their respective shock inception points. For each series $j \in \{0, \dots, J\}$, we define **$T_0$** as the **terminal boundary of the pre-shock regime**.
+
+* **Pre-shock Regime**: The period $t \in \{1, \dots, T_0\}$ where the series follows its undisturbed dynamics.
+* **Post-shock Regime**: The period $t > T_0$ where the "big shock" effect begins to materialize.
+
+The index $T_0$ represents the **last "clean" observation** for the series in its truncated or aligned form. Thus, $T_0+1$ is the **inception of the shock effect**, regardless of whether the physical catalyst occurred exactly at a time index or in the interval between observations (e.g., overnight market news).
+
+
+
+### The Post-Shock Forecasting Objective
+
+The framework is designed to correct the target's trajectory $Y_{0, T_0+1}, \dots, Y_{0, T_0+k}$ following a major disruption. We decompose the final forecast into a "no-shock" baseline and a donor-informed synthetic adjustment $\hat{\omega}_h$:
+
+\[
+\hat{Y}_{0, T_0+h} = \underbrace{\hat{Y}_{0, T_0+h}^{\text{baseline}}}_{\text{Standard ARIMA/GARCH}} + \underbrace{\hat{\omega}_h}_{\text{Synthetic Shock Adjustment}}, \quad h = 1, \dots, k
+\]
+
+This decomposition explicitly targets the bias introduced by big shocks, ensuring that $\hat{\omega}_h$ captures the magnitude of the regime shift that standard models would otherwise ignore.
+
+### Software Mapping
+
+In the `postshock` package, the theoretical boundaries and regime definitions are operationalized through specific user-supplied arguments. To ensure the framework correctly captures the magnitude of the shock, the data must be aligned as follows:
+
+* **Regime Boundaries ($T_0$):** Specified via the `shock_time_vec` argument. Each element $j$ in this vector must be the **integer index of the last clean observation** for that specific series $Y_j$.
+    * *Example:* `shock_time_vec <- c(500, 450, 600)`
+* **Shock Observation Depth ($L_j$):** Specified via `shock_length_vec`. This defines the number of observations *after* $T_0$ (i.e., from $T_0+1$ to $T_0+L_j$) used to extract the "shock signature" from each donor.
+    * *Example:* `shock_length_vec <- c(10, 10, 10)`
+* **Data Structures:** The series and their respective pre-shock characteristics are passed as lists (`Y_series_list` and `covariates_series_list`). The order of elements in these lists must strictly match the order in `shock_time_vec`.
+
+## Donor balancing weights (`dbw`)
+
+The first component of the framework is a donor balancing weights procedure, implemented in the function `dbw()`. The goal is to construct a weight vector
+\[
+\omega = (\omega_1,\dots,\omega_J)^\top
+\]
+on the donor series such that a weighted combination of donors closely matches the target on a pre-shock window. Intuitively, donors that look more similar to the target before the shock should receive larger weights, while dissimilar donors should receive smaller (or zero) weights.
+
+For exposition, suppose that each series is represented by a feature vector \(z_i \in \mathbb{R}^K\) summarizing its pre-shock history, where \(i=0\) denotes the target and \(i=1,\dots,J\) denote the donors. These features can include raw covariates at the last pre-shock time, multiple lookback values, and transformed auxiliary information, as described below. Let
+\[
+z_0 \in \mathbb{R}^K \quad\text{and}\quad
+Z_0 = \begin{pmatrix} z_1^\top \\ \vdots \\ z_J^\top \end{pmatrix} \in \mathbb{R}^{J \times K}
+\]
+collect the target feature vector and the donor feature matrix. A basic formulation of the donor balancing problem is then
+\[
+\min_{\omega} \ \bigl\| z_0 - Z_0^\top \omega \bigr\|_p + \lambda \cdot \text{pen}(\omega)
+\quad\text{subject to}\quad
+\sum_{j=1}^J \omega_j = 1,\qquad
+L \le \omega_j \le U \ \text{for all } j,
+\]
+where \(\|\cdot\|_p\) is either an \(\ell_1\) or \(\ell_2\) norm, \(\lambda \ge 0\) is a regularization parameter, \(\text{pen}(\omega)\) is an \(\ell_1\) (LASSO-type) or \(\ell_2\) (ridge-type) penalty on the weights, and \(L,U\) are lower and upper bounds. The simplex constraint \(\sum_j \omega_j = 1\) together with nonnegative bounds ensures that \(\omega\) can be interpreted as convex combination weights on the donors.
+
+For clarity, we summarize the main notation used in this section. The integer \(J\) denotes the number of donor series, and \(K\) is the dimension of the feature vectors used for balancing. For each series \(i\), the vector \(z_i \in \mathbb{R}^K\) collects its pre-shock features, with \(z_0\) corresponding to the target and \(z_1,\dots,z_J\) to the donors. The matrix \(Z_0 \in \mathbb{R}^{J\times K}\) stacks the donor features row-wise, so that \(Z_0^\top \omega\) is the weighted donor feature vector under weights \(\omega = (\omega_1,\dots,\omega_J)^\top \in \mathbb{R}^J\). The parameter \(p \in \{1,2\}\) determines whether an \(\ell_1\) or \(\ell_2\) norm is used in the matching loss, and \(\lambda \ge 0\) controls the strength of the penalty \(\text{pen}(\omega)\), which can be either \(\ell_1\)-type (LASSO) or \(\ell_2\)-type (ridge) depending on the argument `penalty_normchoice`. The constants \(L\) and \(U\) are lower and upper bounds on each weight, typically \(L=0\) and \(U=1\), while the equality constraint \(\sum_{j=1}^J \omega_j = 1\) (corresponding to `sum_to_1 = TRUE`) enforces that \(\omega\) defines a convex combination of the donor series.
+
+In the `postshock` implementation, the input `X` is a list of data frames or matrices. The first element `X[[1L]]` contains the target series, and the remaining elements `X[[2L]]`, …, `X[[J+1L]]` contain the donors. Rows correspond to time and columns to features. The integer vector `dbw_indices` selects which feature columns are used in the matching objective. The vector `shock_time_vec` has the same length as `X` and records, for each series, the last pre-shock row; each series is truncated to rows `1:shock_time_vec[i]` before any further processing.
+
+Several options control how the feature vectors \(z_i\) are constructed:
+
+- The optional list `Y` can contain auxiliary series for each element of `X`, for example returns or transformed variables.  
+- The argument `Y_lookback_indices` specifies which backwards-looking rows of `Y[[i]]` are to be used (for example, `c(1, 2, 5)` corresponds to the last, second last, and fifth last pre-shock rows), and the function `inputted_transformation` is applied to each `Y[[i]]` before these lookback values are extracted.  
+- Similarly, `X_lookback_indices` can be used to extract multiple lookback rows from the truncated `X[[i]]`; if `X_lookback_indices` is `NULL`, only the final pre-shock row is used.  
+
+The selected rows are vectorized and concatenated to form a single feature vector for each series. Constant columns are removed automatically, and optional centering and scaling are applied via the logical arguments `center` and `scale`. If `princ_comp_count` is not `NULL`, a principal component analysis is performed and only the specified number of leading components are retained, which can help mitigate collinearity in high-dimensional settings.
+
+Distance and regularization choices are controlled by the arguments `normchoice`, `penalty_normchoice`, and `penalty_lambda`. The argument `normchoice` is either `"l1"` or `"l2"`, corresponding to \(\ell_1\) or \(\ell_2\) distance in the matching loss. The argument `penalty_normchoice` selects an \(\ell_1\) (`"l1"`) or \(\ell_2\) (`"l2"`) penalty on the weights, and `penalty_lambda` is constrained to be nonnegative and specifies the penalty strength. When `sum_to_1 = TRUE` and the bounds `bounded_below_by` and `bounded_above_by` enforce nonnegative weights, the \(\ell_1\) norm of \(\omega\) is (up to numerical tolerance) fixed at one; in this regime an \(\ell_1\) penalty only adds a constant to the objective and does not change the minimizer, so an \(\ell_2\) penalty is typically more effective under simplex constraints.
+
+Formally, the optimization problem is solved using the `solnp` routine from the `Rsolnp` package, subject to the box constraints `bounded_below_by` and `bounded_above_by` and the optional equality constraint `sum_to_1`. The function returns a list with three main components: `opt_params`, the estimated donor weight vector \(\hat{\omega}\); `loss`, the final matching loss; and `convergence`, a flag indicating whether the numerical optimizer reports successful convergence. These weights are then used inside `SynthPrediction()` and `SynthVolForecast()` to combine donor-specific forecasts for the target series.
+
+In the illustrative examples and empirical applications below, we often use a
+convex-combination specification with \(\ell_2\)-regularized weights. A typical
+configuration is:
+
+- `sum_to_1 = TRUE`
+- `bounded_below_by = 0`
+- `bounded_above_by = 1`
+- `normchoice = "l2"`
+- `penalty_normchoice = "l2"`
+- `penalty_lambda = 1e-2`
+
+Under this configuration, the weights can be interpreted as nonnegative donor
+shares that sum to one and therefore define a convex combination. The
+\(\ell_2\) penalty stabilizes the solution when donors are highly correlated.
+This specification corresponds to a constrained ridge-type matching problem on
+the simplex.
+
+The following example illustrates the computation of donor weights using three pre-shock features.
+```{r dbw-example, echo=TRUE}
+set.seed(1)
+
+T  <- 50
+K  <- 3
+
+# Construct a target and two donors with K=3 features
+target <- data.frame(
+  x1 = rnorm(T),
+  x2 = rnorm(T,  0.2),
+  x3 = rnorm(T, -0.1)
+)
+donor1 <- data.frame(
+  x1 = rnorm(T,  0.1),
+  x2 = rnorm(T, -0.1),
+  x3 = rnorm(T,  0.3)
+)
+donor2 <- data.frame(
+  x1 = rnorm(T, -0.2),
+  x2 = rnorm(T,  0.4),
+  x3 = rnorm(T,  0.0)
+)
+
+X_list <- list(target, donor1, donor2)
+shock  <- c(40, 40, 40)   # last pre-shock row for each series
+
+dbw_out <- dbw(
+  X                 = X_list,
+  dbw_indices       = 1:K,
+  shock_time_vec    = shock,
+  center            = TRUE,
+  scale             = TRUE,
+  sum_to_1          = TRUE,
+  bounded_below_by  = 0,
+  bounded_above_by  = 1,
+  normchoice        = "l2",
+  penalty_normchoice = "l2",
+  penalty_lambda    = 1e-2
+)
+
+cat("Estimated donor weights:\n")
+print(round(dbw_out$opt_params, 3))
+
+cat("\nFinal matching loss:\n")
+print(dbw_out$loss)
+
+cat("\nConvergence flag:\n")
+print(dbw_out$convergence)
+
+```
+
+
+## Synthetic mean forecasting (`SynthPrediction`)
+
+The second component of the framework is a synthetic mean–forecasting
+procedure, implemented in the function `SynthPrediction()`.  The aim is to
+produce \(k\)-step-ahead forecasts for a target series by combining
+information from a pool of donor series that have experienced structural
+shocks in the past.  The procedure operates in four layers:
+(i) estimation of donor-specific shock effects via (S)ARIMA models with a
+post-shock indicator; (ii) construction of donor weights (either equal or
+DBW-based); (iii) fitting an ARIMA model to the pre-shock portion of the
+target; and (iv) adjusting the target forecast by the weighted donor shock
+effect.
+
+For notation, let \(Y_{i,t}\) denote the value of series \(i=0,1,\dots,J\) at
+time \(t\), where \(i=0\) is the target and \(i=1,\dots,J\) are donors.
+For each series we observe a shock start time \(T_i\) and a post-shock window
+length \(L_i\).  In the implementation these are supplied via the vectors
+`shock_time_vec` and `shock_length_vec`, and are first converted to integer
+indices that match the time index of `Y_series_list`.
+
+### Donor-level (S)ARIMA with post-shock indicators
+
+For each donor \(i=1,\dots,J\), we model the series as a baseline
+time-series component plus a structural shock effect. Specifically, we
+consider the decomposition
+\[
+Y_{i,t}
+=
+\mu_{i,t}
++
+\gamma_i D_{i,t}
++
+\varepsilon_{i,t},
+\]
+where \( \mu_{i,t} \) follows an ARIMA or seasonal ARIMA process, \(D_{i,t}\)
+is a post-shock indicator defined by
+\[
+D_{i,t} =
+\begin{cases}
+0, & t \le T_i,\\
+1, & T_i < t \le T_i + L_i,
+\end{cases}
+\]
+and \(\varepsilon_{i,t}\) denotes the innovation term. The parameter \(\gamma_i\) captures the average level shift induced by the shock over the specified window.
+
+In the implementation, `SynthPrediction()` estimates this model using
+`forecast::auto.arima()` (or a user-specified `arima_order`), with a design
+matrix whose columns consist of the post-shock indicator and any selected
+covariates. The function `decide_seasonal()` determines whether a seasonal
+component should be included based on the detected or user-specified period.
+
+If the argument `covariate_indices` is non-`NULL`, the donor design matrix
+contains both the post-shock indicator and the selected columns of
+`covariates_series_list[[i]]` as contemporaneous regressors.  If
+`covariate_indices` is `NULL`, the only regressor is the post-shock
+indicator.  After fitting the model, the donor shock effect
+\(\widehat{\gamma}_i\) is extracted as the coefficient associated with the post-shock indicator regressor
+(i.e., the post-shock indicator) using `lmtest::coeftest()`.  Collecting these
+into a vector
+\[
+\widehat{\boldsymbol{\gamma}} = (\widehat{\gamma}_1,\dots,\widehat{\gamma}_J)^\top,
+\]
+we obtain donor-level estimates of how each past shock affected its
+corresponding series over the specified window.
+
+### Donor weighting
+
+In the second layer, `SynthPrediction()` constructs donor weights
+\(\boldsymbol{w} = (w_1,\dots,w_J)^\top\).  If `use_dbw = FALSE`, equal
+weights \(w_j = 1/J\) are used.  If `use_dbw = TRUE`, the function calls
+`dbw()` to compute data-driven weights based on pre-shock covariates.
+
+For this purpose, the object `X_for_dbw` is formed by taking
+`covariates_series_list` (if available) or falling back to `Y_series_list`.
+Each element is converted to a numeric matrix.  If `dbw_indices` is `NULL`,
+informative columns are selected automatically by examining cross-series
+variance at the last pre-shock row and discarding nearly constant columns.
+The resulting indices, together with the integer shock times, are passed to
+`dbw()` along with options such as `dbw_scale`, `dbw_center`,
+`penalty_lambda`, and `penalty_normchoice`.  When `dbw()` succeeds, the
+optimal weights \(\widehat{\boldsymbol{w}}\) are taken from
+`dbw_output$opt_params`; otherwise the procedure falls back to equal weights.
+
+The combined donor shock effect used for adjustment is then
+\[
+\widehat{\theta} = \sum_{j=1}^J \widehat{w}_j \widehat{\gamma}_j,
+\]
+which aggregates individual donor effects according to their DBW weights.
+
+### Target (S)ARIMA and shock adjustment
+
+In the third layer, we fit an ARIMA model to the target series using only
+pre-shock data.  Let \(T_0\) denote the last pre-shock time for the target.
+`SynthPrediction()` restricts the target series to observations
+\(t = 1,\dots,T_0\) and fits an ARIMA or seasonal ARIMA model in the same
+manner as for the donors, using `auto.arima()` or a user-specified
+`arima_order`.  If `covariate_indices` is non-`NULL`, the selected columns of
+`covariates_series_list[[1]]` are lagged by one period (via `lag.xts`) and
+included as `xreg` for model fitting.  For forecasting, the last pre-shock
+covariate row is replicated \(k\) times to form the `newxreg` matrix, so that
+the \(k\)-step-ahead forecasts correspond to holding the covariates fixed at
+their last observed values.
+
+Let \(\widehat{Y}^{\text{raw}}_{0,T_0+h}\) denote the resulting raw forecast
+for the target at horizon \(h = 1,\dots,k\).  The adjusted “DBW version”
+forecast is defined by
+\[
+\widehat{Y}^{\text{adj}}_{0,T_0+h}
+  = \widehat{Y}^{\text{raw}}_{0,T_0+h} + \widehat{\theta},
+\]
+which adds the weighted donor shock effect \(\widehat{\theta}\) to the raw
+ARIMA forecast. This adjustment relies on the identifying assumption that the weighted donor shock effect provides a consistent proxy for the counterfactual shock effect on the target under comparable structural conditions. For comparison, the function also computes an “arithmetic
+mean” version that uses the simple average of donor effects,
+\[
+\widehat{Y}^{\text{arith}}_{0,T_0+h}
+  = \widehat{Y}^{\text{raw}}_{0,T_0+h}
+    + \frac{1}{J} \sum_{j=1}^J \widehat{\gamma}_j.
+\]
+
+The outputs of `SynthPrediction()` are collected in a list with three main
+components.  The element `linear_combinations` contains the donor weight
+vector \(\widehat{\boldsymbol{w}}\); `predictions` contains three forecast
+vectors labelled `unadjusted`, `adjusted`, and `arithmetic_mean`; and `meta`
+stores additional information such as the donor-specific \(\widehat{\gamma}_j\),
+the combined effect \(\widehat{\theta}\), the ARIMA orders, and the information
+criterion used.  These objects are used in Section 4 to construct the
+empirical results.
+
+#### Illustrative simulation example
+
+To illustrate how `SynthPrediction()` behaves in a simple setting, we simulate one
+target series and two donor series observed on a daily grid with \(T = 200\).
+The target \(Y_0\) is a random walk around level 100. Donor 1 is a very close
+copy of the target (small extra noise), while donor 2 is much noisier. As
+covariates we construct a second random walk (“base signal”) and create two
+highly informative covariates \(X_0, X_1\) plus one largely uninformative
+covariate \(X_2\). We treat time index \(T_0 = 150\) as the shock time for all
+series and estimate a one–step–ahead forecast (\(k=1\)).
+
+```{r synthprediction-example, echo=TRUE}
+library(xts)
+set.seed(123)
+
+## 1) Target and donors ---------------------------------
+T     <- 200
+dates <- seq.Date(as.Date("2021-01-01"), by = "day", length.out = T)
+
+# target: random walk around level 100
+y0 <- cumsum(rnorm(T, mean = 0, sd = 1)) + 100
+Y0 <- xts(y0, order.by = dates)
+
+# donor 1: very similar to target (small extra noise)
+y1 <- y0 + rnorm(T, mean = 0, sd = 0.1)
+Y1 <- xts(y1, order.by = dates)
+
+# donor 2: noisier copy of target
+y2 <- y0 + rnorm(T, mean = 0, sd = 2)
+Y2 <- xts(y2, order.by = dates)
+
+Y_list <- list(Y0, Y1, Y2)
+
+## 2) Covariates ---------------------------------------
+base_signal <- cumsum(rnorm(T, mean = 0, sd = 1))   # common latent factor
+
+X0 <- xts(base_signal + rnorm(T, sd = 0.1), order.by = dates)
+X1 <- xts(base_signal + rnorm(T, sd = 0.1), order.by = dates)
+X2 <- xts(cumsum(rnorm(T, sd = 2)),        order.by = dates)  # less informative
+
+X_list <- list(X0, X1, X2)
+
+## 3) Shock specification ------------------------------
+shock_time_vec   <- c(150, 150, 150)  # shock happens at time 150
+shock_length_vec <- c(1L,  1L,  1L)   # one-step post-shock window
+
+## 4) Run SynthPrediction ------------------------------
+res <- SynthPrediction(
+  Y_series_list          = Y_list,
+  covariates_series_list = X_list,
+  shock_time_vec         = shock_time_vec,
+  shock_length_vec       = shock_length_vec,
+  k                      = 1,
+  covariate_indices      = 1,
+  seasonal               = FALSE,
+  plots                  = FALSE
+)
+
+res$linear_combinations      # DBW donor weights
+res$predictions              # raw / adjusted forecasts
+
+# True value of Y0 at T0+1 (time 151)
+Y_list[[1]][150:151]
+truth <- as.numeric(Y_list[[1]][151])
+
+c(
+  truth      = truth,
+  raw        = res$predictions$unadjusted[1],
+  dbw_adj    = res$predictions$adjusted[1],
+  arith_mean = res$predictions$arithmetic_mean[1]
+)
+
+```
+
+## Structured donor pools (MultiPool extension)
+
+In some applications, the donor set may contain shocks generated by different economic mechanisms. For example, the ConocoPhillips application contains both financial-crisis-related shocks and oil-supply-related shocks. Treating all donors as a single homogeneous pool may hide this structure and make the final adjustment harder to interpret.
+
+The MultiPool extension is implemented as a structured wrapper around the existing SynthPrediction() workflow. It does not define a separate forecasting model. Instead, when the argument pools is provided, SynthPrediction() dispatches to the MultiPool routine, which repeatedly applies the standard SynthPrediction() workflow to user-specified donor subsets. Each subset represents an interpretable shock channel, such as a demand-side or supply-side donor group. The resulting pool-level shock adjustments are then combined using a user-specified aggregation rule, such as summation or weighted averaging.
+
+This design keeps the baseline forecasting machinery unchanged. The single-pool SynthPrediction() workflow remains the core computational unit, while MultiPool adds an additional aggregation layer on top of it. In this sense, MultiPool should be interpreted as a structured donor-pool organization mechanism rather than a separate model class.
+
+### Pool structure and notation
+
+Let \(Y_{i,t}\), \(i = 0,1,\dots,J\), denote the target series (\(i=0\)) and donor series (\(i=1,\dots,J\)) observed over time \(t\). Donors are grouped into \(G\) **potentially overlapping pools**
+\[
+\mathcal{J}_1, \dots, \mathcal{J}_G,
+\]
+supplied as a named list
+\[
+\texttt{pools} = \{\mathcal{J}_g\}_{g=1}^G,
+\]
+where each element contains donor series names that match
+`names(Y_series_list)`. The first element of `Y_series_list` is always treated
+as the target.
+
+> **Practical requirement.** Since pools refer to donors by name, `Y_series_list`
+> (and, if provided, `covariates_series_list`) must be named with consistent
+> ordering.
+
+
+### Step 1: Common baseline forecast (unique counterfactual)
+
+The procedure first computes a **single baseline forecast** by calling
+`SynthPrediction()` on the full donor set (without pool structure). This defines
+the unique counterfactual forecasting path used throughout the multi-pool
+procedure and produces a raw \(k\)-step-ahead forecast
+\[
+\widehat{Y}^{\mathrm{raw}}_{0,T_0+h}, \quad h=1,\dots,k,
+\]
+stored as `predictions$unadjusted`.
+
+Whether donor balancing weights (DBW) are used in this baseline run is
+controlled by `base_use_dbw`.
+
+> **Role of Step 1.** Step 1 defines the only baseline counterfactual forecast.
+> All multi-pool variants differ only in how the shock adjustment term is
+> constructed, not in how the raw counterfactual path is generated.
+
+
+### Step 2: Pool-specific shock adjustments (channel extraction)
+
+For each pool \(g\), the algorithm:
+
+1. Subsets the series list to include the target and the donors in
+   \(\mathcal{J}_g\).
+
+2. Runs `SynthPrediction()` on this restricted subset, optionally using DBW
+   within the pool (controlled by `pool_use_dbw`).
+
+3. Extracts the pool-level combined donor shock quantity
+   \[
+   \widehat{\theta}_g \equiv \widehat{\omega}_g,
+   \]
+   obtained from the subset output’s `meta$combined_omega`.
+
+Each \(\widehat{\theta}_g\) is interpreted as a **pool-specific shock adjustment**
+capturing the contribution of the structural channel represented by pool \(g\)
+under comparable pre-shock conditions. Importantly, the pool-specific runs are
+**not used as alternative forecasts**; they serve only as devices to extract
+pool-level shock adjustments under donor restrictions.
+
+Collecting across pools yields
+\[
+\widehat{\boldsymbol{\theta}}
+=
+(\widehat{\theta}_1,\dots,\widehat{\theta}_G)^\top.
+\]
+
+> **DBW at baseline vs within pools.** DBW at baseline enforces global pre-shock
+> balance using the full donor set. DBW within pools enforces balance conditional
+> on the pool restriction. These serve distinct roles and should not be
+> interpreted as “double balancing” the same objective.
+
+
+### Step 3: Cross-pool aggregation (constructing the adjustment)
+
+The pool-level shock adjustments \(\widehat{\boldsymbol{\theta}}\) are aggregated into a single scalar adjustment term \(\widehat{\theta}\) using the pool_agg rule.
+
+- **Sum aggregation**
+  \[
+  \widehat{\theta}
+  =
+  \sum_{g=1}^G \widehat{\theta}_g.
+  \]
+
+- **Weighted aggregation**
+  Given user-specified weights \(\pi_g\),
+  \[
+  \widehat{\theta}
+  =
+  \sum_{g=1}^G \pi_g \widehat{\theta}_g.
+  \]
+  The weighted case requires a named numeric vector aligned with pool names.
+
+- **Modeling choice.** 
+Sum aggregation corresponds to an additive structural decomposition of the target shock effect across channels. Weighted aggregation imposes a user-specified contribution profile. Neither aggregation rule is implied by the data; both encode modeling/identification assumptions.
+
+
+### Step 4: Multi-pool adjusted forecast
+
+The final multi-pool forecast is defined as
+\[
+\widehat{Y}^{\mathrm{adj,mp}}_{0,T_0+h}
+=
+\widehat{Y}^{\mathrm{raw}}_{0,T_0+h}
++
+\widehat{\theta}, \quad h=1,\dots,k.
+\]
+This adjusted series is stored as `predictions$adjusted_multipool`.
+
+Importantly, the baseline raw forecast is unchanged; only the shock adjustment
+term differs across pooling strategies.
+
+### Output structure
+
+The multi-pool extension preserves the original output of `SynthPrediction()`
+and adds:
+
+- `predictions$adjusted_multipool`,
+- `meta$multi_pool`, which contains
+  - the pool definitions,
+  - pool-specific shock adjustments \(\{\widehat{\theta}_g\}\),
+  - aggregation rule and (optional) weights,
+  - aggregated adjustment \(\widehat{\theta}\),
+  - indicators of whether DBW was used at baseline or within pools.
+
+This design enables **decomposition analysis**, allowing practitioners to
+attribute portions of the final adjustment to distinct structural channels as
+encoded by the donor pools.
+
+### Identification interpretation
+
+The multi-pool framework generalizes the single-pool identifying assumption by
+allowing donor heterogeneity to be represented explicitly through pool
+structure.
+
+Within each pool \(g\), pooled donor shock adjustment \(\widehat{\theta}_g\) is
+assumed to provide a valid proxy for the corresponding structural component of
+the target’s counterfactual shock effect under comparable pre-shock conditions.
+
+When sum aggregation is used, an additional **additive separability**
+assumption is invoked:
+\[
+\theta_{\text{target}}
+=
+\sum_{g=1}^G \theta_g.
+\]
+Under this assumption, the aggregated adjustment \(\widehat{\theta}\) provides a
+reduced-form estimate of the total shock adjustment constructed from the sum of
+pool-level components. This hierarchical structure relaxes the homogeneous-donor
+assumption of the baseline method while preserving interpretability and
+computational tractability.
+
+```{r synthprediction-multipool-example, echo=TRUE}
+## MultiPool example: reuse the same simulated data above -----------------
+
+# 0) IMPORTANT: MultiPool requires named lists (pools refer to donors by name)
+names(Y_list) <- c("target", "donor_close", "donor_noisy")
+names(X_list) <- c("target", "donor_close", "donor_noisy")  # keep aligned with Y_list
+
+# 1) Define donor pools (channels)
+pools <- list(
+  close_copy = c("donor_close"),
+  noisy_copy = c("donor_noisy")
+)
+
+# 2) Example pool weights (must align with pool names)
+pool_weights <- c(
+  close_copy = 0.5,
+  noisy_copy = 0.5
+)
+
+# 3) Run MultiPool with weighted aggregation
+res_mp <- SynthPrediction(
+  Y_series_list          = Y_list,
+  covariates_series_list = X_list,
+  shock_time_vec         = shock_time_vec,
+  shock_length_vec       = shock_length_vec,
+  k                      = 1,
+  covariate_indices      = 1,
+  seasonal               = FALSE,
+  plots                  = FALSE,
+  pools                  = pools,
+  pool_agg               = "weighted",
+  pool_weights           = pool_weights,
+  base_use_dbw           = TRUE,
+  pool_use_dbw           = TRUE
+)
+
+# Inspect pool effects + aggregated effect
+res_mp$meta$multi_pool$pool_effects
+res_mp$meta$multi_pool$aggregated_effect
+
+# Compare forecasts
+c(
+  truth          = truth,
+  raw            = res_mp$predictions$unadjusted[1],
+  single_adj_dbw = res_mp$predictions$adjusted[1],
+  multipool_adj  = res_mp$predictions$adjusted_multipool[1]
+)
+```
+
+## Adjustment for additional confounding shocks
+
+In empirical applications, the primary shock of interest may not be the only
+event affecting the target series during the post-shock period. Additional
+confounding shocks—such as subsequent product releases, policy announcements,
+or macroeconomic disturbances—may occur within or shortly after the main shock
+window. If left unaccounted for, these confounding shocks can bias the estimated
+shock adjustment and distort counterfactual forecasts.
+
+To address this issue, the proposed framework allows **explicit control for
+additional confounding shocks** through structured shock regressors included
+in the forecasting model.
+
+### Confounding shock specification
+
+Let \(T_0\) denote the onset of the primary shock of interest. Suppose that
+additional confounding shocks occur at times
+\[
+T_1, T_2, \dots, T_M,
+\]
+with corresponding durations
+\[
+L_1, L_2, \dots, L_M.
+\]
+
+For each confounding shock \(m = 1,\dots,M\), we construct a deterministic shock
+indicator
+\[
+D_{m,t} =
+\mathbf{1}\{T_m \le t < T_m + L_m\},
+\]
+or, more generally, a user-specified shock profile (e.g., step, pulse, or
+finite window effect). These indicators are collected into a matrix of
+confounding shock regressors
+\[
+\mathbf{D}_t = (D_{1,t}, \dots, D_{M,t})^\top.
+\]
+
+The primary shock timing is still supplied through `shock_time_vec` and `shock_length_vec`. Additional control shocks are supplied separately through the `control_shocks` argument and converted into target-side regressors by `build_control_xreg()`.
+
+### Forecasting model with confounding shocks
+
+Let \(Y_{0,t}\) denote the target series. Conditional on the donor-based
+counterfactual structure, the forecasting equation is augmented to include
+confounding shocks as exogenous regressors:
+\[
+Y_{0,t}
+=
+\mu_t
++
+\alpha \, \mathbf{1}\{t \ge T_0\}
++
+\boldsymbol{\gamma}^\top \mathbf{D}_t
++
+\varepsilon_t,
+\]
+where
+
+- \(\mu_t\) represents the baseline mean component;
+
+- \(\alpha\) captures the primary shock effect;
+
+- \(\boldsymbol{\gamma}\) captures the effects of additional control shocks;
+
+- \(\varepsilon_t\) is an idiosyncratic error term.
+
+The control-shock regressors are included in the target-side forecasting model so that known additional events can be accounted for when fitting the baseline dynamics. This reduces the risk that the donor-based adjustment is interpreted as capturing movements that are actually associated with other known events.
+
+### Relation to additive shock decomposition
+
+This approach is closely related to empirical strategies that decompose observed
+outcomes into additive effects of multiple structural shocks. For example,
+existing work in macroeconomics and energy economics studies supply- and
+demand-driven shocks by modeling their effects as additive components of the
+observed response.
+
+In contrast to structural VAR approaches—where additivity parameters are
+estimated within a fully parametric system—the present framework adopts a
+reduced-form perspective. Confounding shocks are controlled via explicit
+exogenous regressors, while donor-based counterfactuals capture the underlying
+baseline dynamics. Additivity across shocks is imposed as an identifying
+assumption rather than inferred from a structural model.
+
+### Interaction with MultiPool adjustment
+
+The control-shock adjustment is conceptually separate from the MultiPool extension described in the previous section. Specifically:
+
+1. MultiPool decomposes the primary shock effect across heterogeneous donor
+   channels.
+2. Confounding shock controls help account for subsequent or overlapping events.
+
+When both mechanisms are used, the final adjusted forecast takes the form
+\[
+\widehat{Y}_{0,T_0+h}
+=
+\widehat{Y}^{\mathrm{raw}}_{0,T_0+h}
++
+\widehat{\theta}
++
+\boldsymbol{\gamma}^\top \mathbf{D}_{T_0+h},
+\]
+where \(\widehat{\theta}\) is the aggregated MultiPool adjustment.
+
+This layered structure allows practitioners to disentangle (i) baseline
+counterfactual dynamics, (ii) primary shock effects decomposed across donor
+channels, and (iii) additional confounding shocks, within a unified forecasting
+pipeline.
+
+### Practical considerations
+
+- Confounding shocks should be declared only when their timing and qualitative
+  interpretation are well understood.
+- Over-specification of shock controls may reduce efficiency, particularly in
+  short post-shock samples.
+- When multiple confounding shocks overlap in time, estimated coefficients
+  should be interpreted jointly rather than individually.
+
+Overall, explicit adjustment for additional confounding shocks enhances the
+credibility and interpretability of post-shock forecasts, particularly in
+settings where multiple discrete events affect the target series within a
+narrow time window.
+
+```{r synthprediction-example-short, echo=TRUE, message=FALSE, warning=FALSE}
+library(xts)
+set.seed(123)
+
+## 1) Target and donors ---------------------------------
+T     <- 200
+dates <- seq.Date(as.Date("2021-01-01"), by = "day", length.out = T)
+
+# target: random walk around level 100
+y0 <- cumsum(rnorm(T, mean = 0, sd = 1)) + 100
+
+# donor 1: very similar to target (small extra noise)
+y1 <- y0 + rnorm(T, mean = 0, sd = 0.1)
+
+# donor 2: noisier copy of target
+y2 <- y0 + rnorm(T, mean = 0, sd = 2)
+
+Y_list <- list(
+  target = xts(y0, order.by = dates),
+  donor1 = xts(y1, order.by = dates),
+  donor2 = xts(y2, order.by = dates)
+)
+
+## 2) Covariates ---------------------------------------
+base_signal <- cumsum(rnorm(T, mean = 0, sd = 1))
+
+X_list <- list(
+  target = xts(base_signal + rnorm(T, sd = 0.1), order.by = dates),
+  donor1 = xts(base_signal + rnorm(T, sd = 0.1), order.by = dates),
+  donor2 = xts(cumsum(rnorm(T, sd = 2)),         order.by = dates)
+)
+
+## 3) Shock specification ------------------------------
+t_main <- 150L
+shock_time_vec   <- rep(t_main, length(Y_list))
+shock_length_vec <- rep(1L,     length(Y_list))
+
+## 4) Run SynthPrediction (no confounding control) -----
+res <- SynthPrediction(
+  Y_series_list          = Y_list,
+  covariates_series_list = X_list,
+  shock_time_vec         = shock_time_vec,
+  shock_length_vec       = shock_length_vec,
+  k                      = 1,
+  covariate_indices      = 1,
+  seasonal               = FALSE,
+  plots                  = FALSE
+)
+
+# 1-step truth (time t_main+1)
+truth <- as.numeric(Y_list$target[t_main + 1])
+
+c(
+  truth      = truth,
+  raw        = as.numeric(res$predictions$unadjusted[1]),
+  adjusted   = as.numeric(res$predictions$adjusted[1]),
+  arith_mean = as.numeric(res$predictions$arithmetic_mean[1])
+)
+
+## 5) OPTIONAL: add one confounding shock on the target only ----
+# Example: a short confounding event before the main shock
+t_conf   <- 120L
+len_conf <- 5L
+
+control_shocks <- vector("list", length(Y_list))
+control_shocks[[1]] <- list(list(time = t_conf, length = len_conf, shape = "window"))
+
+res_ctl <- SynthPrediction(
+  Y_series_list          = Y_list,
+  covariates_series_list = X_list,
+  shock_time_vec         = shock_time_vec,
+  shock_length_vec       = shock_length_vec,
+  k                      = 1,
+  covariate_indices      = 1,
+  control_shocks         = control_shocks,
+  seasonal               = FALSE,
+  plots                  = FALSE
+)
+
+c(
+  truth        = truth,
+  raw          = as.numeric(res_ctl$predictions$unadjusted[1]),
+  adjusted_ctl = as.numeric(res_ctl$predictions$adjusted[1])
+)
+```
+
+## Volatility model selection (`auto_garchx`)
+
+
+The next component of the framework is a volatility–forecasting module based on
+GARCH–type models with exogenous regressors. It is implemented in the function
+`auto_garchx()`, which selects a GARCHX specification by BIC and optionally
+refits the selected model using a more stable backcast for the conditional
+variance.
+
+Let \(\{y_t\}_{t=1}^n\) denote a (demeaned) return series and let \(x_t\) collect
+exogenous regressors (if any). Following the parametrisation of the `garchx`
+package, we consider models of the form
+\[
+y_t = \sigma_t \varepsilon_t, \qquad \varepsilon_t \sim \text{i.i.d. }(0,1),
+\]
+with conditional variance
+\[
+\sigma_t^2
+  = \omega
+  + \sum_{i=1}^q \alpha_i y_{t-i}^2
+  + \sum_{j=1}^p \beta_j \sigma_{t-j}^2
+  + \sum_{\ell=1}^q \gamma_\ell y_{t-\ell}^2 \mathbf 1\{y_{t-\ell}<0\}
+  + \delta^\top x_t .
+\]
+Here \(q\) is the ARCH order, \(p\) is the GARCH order, and the coefficients
+\(\gamma_\ell\) capture GJR–type asymmetry. In the `garchx` implementation
+these orders are supplied as an integer vector \(\texttt{order} = (q,p,o)\),
+where \(o \in \{0,1\}\) indicates whether the asymmetric GJR term is included
+(\(o = 1\)) or not (\(o = 0\)).
+
+The main arguments of `auto_garchx()` are:
+
+- `y`: numeric vector of returns or residuals (no `NA`/`Inf`/`NaN`);
+- `xreg`: optional matrix of exogenous regressors aligned with `y`;
+- `max.p`, `max.q`: upper bounds for the GARCH (`p`) and ARCH (`q`) orders;
+- `search_o`: subset of \(\{0,1\}\) indicating whether symmetric (`o = 0`)
+  and/or asymmetric (`o = 1`) specifications are considered;
+- `final_refit`: logical flag controlling whether a second “backcast refit”
+  step is applied to the selected model;
+- `clamp_factor`: two–element numeric vector controlling the range used to
+  clamp the unconditional variance relative to the sample variance;
+- `vcov.type`: type of standard errors requested from `garchx`
+  (`"ordinary"` or `"robust"`).
+
+### Grid search over \((q,p,o)\) by BIC
+
+The function `auto_garchx()` performs a grid search over the order triple
+\((q,p,o)\). Given user–supplied maxima `max.q`, `max.p` and the set
+`search_o ⊂ {0,1}`, the function loops over
+\[
+q = 0,\ldots,\texttt{max.q}, \quad
+p = 0,\ldots,\texttt{max.p}, \quad
+o \in \texttt{search\_o},
+\]
+and fits a `garchx` model for each candidate specification. Each fitted model is evaluated using BIC, and the specification with the smallest BIC is selected. If `final_refit = TRUE`, the selected model is optionally refitted using the backcast stabilization step described above.
+
+### Illustrative simulation example
+
+```{r auto-garchx-example, message=FALSE, warning=FALSE, echo=TRUE}
+library(postshock)
+
+## Simulate a GARCH(1,1) series
+set.seed(123)
+n      <- 2000
+omega  <- 0.05
+alpha  <- 0.07
+beta   <- 0.90
+
+eps    <- rnorm(n)
+sigma2 <- numeric(n)
+y      <- numeric(n)
+
+sigma2[1] <- omega / (1 - alpha - beta)
+y[1]      <- sqrt(sigma2[1]) * eps[1]
+
+for (t in 2:n) {
+  sigma2[t] <- omega + alpha * y[t-1]^2 + beta * sigma2[t-1]
+  y[t]      <- sqrt(sigma2[t]) * eps[t]
+}
+
+## Run auto_garchx
+best <- auto_garchx(
+  y,
+  max.p       = 3,
+  max.q       = 3,
+  search_o    = c(0L, 1L),
+  final_refit = TRUE,
+  vcov.type   = "robust",
+  verbose     = FALSE
+)
+
+## Show selected orders and BIC
+c(p = best$p, q = best$q, o = best$o)
+best$bic
+coef(best$fit)
+
+```
+
+## Synthetic volatility forecasting (`SynthVolForecast`)
+
+The last component of the framework is a *synthetic volatility–forecasting* module,
+implemented in the function `SynthVolForecast()`.  
+The goal is to produce \(k\)-step–ahead **variance** forecasts for a target series by combining a standard pre-shock GARCH model with donor-based post-shock variance adjustments.
+
+For one target series and \(J\) donors we observe demeaned returns
+\(\{y_{i,t}\}_{t=1}^n\) and, for donors, a set of contemporaneous covariates
+\(x_{i,t}\).  For each series we also observe a shock time \(T_i\) and a
+post–shock window length \(L_i\), supplied via the vectors `shock_time_vec` and
+`shock_length_vec`, and collected into the list `Y_series_list` (target in
+position 1, donors in positions 2,…,\(J+1\)).
+
+### Donor–level GARCH–X with post–shock indicators
+
+For each donor \(i = 1,\dots,J\) we fit a GARCH–type model with a 0/1
+post–shock indicator.  Following the parametrisation of the
+`garchx` package, we consider
+\[
+y_{i,t} = \sigma_{i,t} \varepsilon_{i,t}, \qquad
+\varepsilon_{i,t} \sim \text{i.i.d. } (0,1),
+\]
+with conditional variance
+\[
+\sigma_{i,t}^2
+  = \omega_i
+  + \sum_{\ell=1}^{q_i} \alpha_{i,\ell} y_{i,t-\ell}^2
+  + \sum_{\ell=1}^{p_i} \beta_{i,\ell} \sigma_{i,t-\ell}^2
+  + \sum_{\ell=1}^{q_i} \gamma_{i,\ell} y_{i,t-\ell}^2
+      \mathbf 1\{y_{i,t-\ell} < 0\}
+  + \delta_i^\top x_{i,t}
+  + \eta_i D_{i,t},
+\]
+where \(q_i\) and \(p_i\) are the ARCH and GARCH orders, and \(D_{i,t}\) is a
+post–shock indicator defined by
+\[
+D_{i,t} =
+\begin{cases}
+ 0, & t \le T_i, \\
+ 1, & T_i < t \le T_i + L_i, \\
+ 0, & t > T_i + L_i .
+\end{cases}
+\]
+
+In the implementation we build the design matrix for donor \(i\) by stacking
+the selected donor covariates (columns chosen via `covariate_indices`) together
+with `post_shock_indicator`, whose coefficient corresponds to \(\eta_i\).
+The function then fits either
+
+- a user–supplied GARCH order `garch_order = c(q,p,o)`, or  
+- if `garch_order = NULL`, a data–driven specification chosen by
+  `auto_garchx()` via BIC over a grid in \((q,p,o)\).
+
+After fitting, the donor–specific post–shock effect
+\(\hat\omega_i^{\ast} := \hat\eta_i\) is extracted using
+`lmtest::coeftest()` if available, and stored in the vector
+\[
+\hat\omega^{\ast} = (\hat\omega_1^{\ast},\dots,\hat\omega_J^{\ast})^\top .
+\]
+
+### Donor weighting via DBW
+
+To transfer information from donors to the target we form a covariate
+collection
+\[
+X_{\text{for dbw}}
+  = \bigl( X_{\text{target}}, X_1,\dots,X_J \bigr),
+\]
+where \(X_{\text{target}}\) is the covariate matrix for the target
+(`target_covariates`) and \(X_j\) is the donor–\(j\) covariate matrix
+(`covariates_series_list[[j]]`).  The function `dbw()` is then used to compute
+donor weights \(w = (w_1,\dots,w_J)^\top\) by solving a regularised balancing
+problem on the pre–shock covariates.  The main tuning parameters are
+
+- `dbw_indices` : which covariate columns enter the balancing problem;  
+- `penalty_lambda` and `penalty_normchoice` : regularisation weight and norm;  
+- `dbw_scale` and `dbw_center` : whether to standardise covariates.
+- `princ_comp_input`: optional number of leading principal components passed to `dbw()`; if `NULL`, PCA is not used.
+
+The resulting combined donor shock effect is
+\[
+\hat\theta = \sum_{j=1}^J w_j \hat\omega_j^{\ast},
+\]
+which aggregates donor–level post–shock effects according to their DBW weights.
+
+### Target GARCH and variance adjustment
+
+For the target series we fit a **pre-shock** GARCH model *without* exogenous
+regressors. Let \(T_0\) denote the last pre-shock time for the target. The
+function `SynthVolForecast()` restricts the target data to \(t = 1,\dots,T_0\)
+and fits either a user-specified `garch_order` or a BIC-selected specification
+via `auto_garchx()`. Because no `xreg` is used for the target, forecasting does
+not require a future `newxreg` matrix.
+
+Let \(\widehat v^{\text{raw}}_{0,T_0+h}\) denote the resulting
+\(k\)-step-ahead **variance** forecast at horizon \(h = 1,\dots,k\). In the
+implementation, the DBW-adjusted volatility forecast is defined as
+\[
+\widehat v^{\text{adj}}_{0,T_0+h}
+=
+\max\left\{
+\widehat v^{\text{raw}}_{0,T_0+h} + \hat\theta,
+\epsilon
+\right\},
+\qquad \epsilon = 10^{-8}.
+\]
+This adjustment adds the combined donor post-shock effect \(\hat\theta\) to the
+raw GARCH variance forecast while enforcing a strictly positive variance
+forecast. For comparison, the function also computes an arithmetic-mean
+adjustment that ignores DBW and uses the simple average of donor effects,
+\[
+\widehat v^{\text{arith}}_{0,T_0+h}
+=
+\max\left\{
+\widehat v^{\text{raw}}_{0,T_0+h}
++
+\frac{1}{J} \sum_{j=1}^J \hat\omega_j^{\ast},
+\epsilon
+\right\}.
+\]
+
+The outputs of `SynthVolForecast()` are collected in a list with three main
+components. The element `linear_combinations` contains the donor weight vector
+\(\hat w\); `predictions` contains three forecast vectors labelled
+`unadjusted`, `adjusted`, and `arithmetic_mean`; and `meta` stores additional
+information such as the donor-specific \(\hat\omega_j^{\ast}\), the combined
+effect \(\hat\theta\), the selected GARCH orders, the donor-specific standard
+errors, and the DBW convergence status. When `return_fits = TRUE`, the fitted
+donor and target GARCH objects are also returned for diagnostic inspection.
+
+Forecast accuracy is evaluated outside `SynthVolForecast()` using realized
+variance proxies, such as next-period squared returns. This separation keeps the
+forecasting function focused on variance prediction and avoids treating the
+latent conditional variance as directly observed.
+
+### Illustrative simulation example
+
+```{r synthvol-example, echo=TRUE, message=FALSE, warning=FALSE}
+library(postshock)
+
+set.seed(123)
+
+## 1) Simulate one target and two donor return series ----------------------
+n    <- 500
+eps0 <- rnorm(n)
+eps1 <- rnorm(n)
+eps2 <- rnorm(n)
+
+# simple homoskedastic DGP for illustration
+y0 <- eps0                     # target
+y1 <- 0.8 * eps0 + 0.2 * eps1  # donor 1, highly correlated with target
+y2 <- 0.5 * eps0 + 0.5 * eps2  # donor 2, less correlated
+
+Y_list <- list(y0, y1, y2)
+
+## 2) Simple covariates for target and donors ------------------------------
+ 
+X1 <- cbind(x1 = rnorm(n), x2 = rnorm(n))  # donor 1 covariates
+X2 <- cbind(x1 = rnorm(n), x2 = rnorm(n))  # donor 2 covariates
+Xt <- cbind(x1 = rnorm(n), x2 = rnorm(n))  # target covariates  
+
+## 3) Shock times and window lengths ---------------------------------------
+shock_time_vec   <- c(350L, 350L, 350L)
+shock_length_vec <- c(20L,  20L,  20L)
+
+## 4) Call SynthVolForecast ------------------------------------------------
+out_vol <- SynthVolForecast(
+  Y_series_list          = Y_list,
+  covariates_series_list = list(X1, X2),
+  target_covariates      = Xt,
+  shock_time_vec         = shock_time_vec,
+  shock_length_vec       = shock_length_vec,
+  k                      = 5,
+  covariate_indices      = 1:2,    
+  dbw_indices            = 1:2,    
+  plots                  = FALSE,
+  return_fits            = FALSE
+)
+
+## 5) Show number of donors, weights, and forecasts ------------------------
+out_vol$meta$n_donors
+out_vol$linear_combinations
+out_vol$predictions
+```
+
+# Data and Empirical Setup
+
+## Data Sources
+
+Our empirical analysis utilizes two processed datasets distributed with the package: a validation dataset centered on Apple Inc. (AAPL) and an empirical dataset focused on ConocoPhillips (COP), a major energy producer.
+
+The underlying raw series were originally retrieved from publicly available sources at daily frequency beginning in January 2000. Specifically, market data were obtained from Yahoo Finance via the `quantmod` package, and inflation data (CPIAUCSL) were obtained from the Federal Reserve Economic Data (FRED).
+
+For the **COP empirical analysis**, the panel includes:
+
+- The daily closing price of ConocoPhillips (ticker: **COP**);
+- The daily closing level of the S&P 500 index (ticker: **^GSPC**);
+- The daily closing price of **WTI crude oil**;
+- The daily U.S. Dollar Index (ticker: DX-Y.NYB);
+- The daily 3-month U.S. Treasury bill rate (ticker: ^IRX);
+- The daily closing level of the **VIX volatility index** (ticker: ^VIX).
+
+For the **Apple validation dataset**, we include:
+
+- The daily closing price of AAPL;
+- The S&P 500 index;
+- The 3-month Treasury bill rate.
+
+The resulting aligned panels are distributed with the package as preprocessed datasets, including `cop_oil_postshock`, `aapl_control_input`, `aapl_onestep_input`, and `iyg_onestep_input`, ensuring fully offline reproducibility.
+
+## Distributed Package Objects
+
+The package distributes four processed input objects used in the empirical
+
+sections:
+
+- `cop_oil_postshock`: aligned outcome and covariate windows for the
+
+  ConocoPhillips empirical application;
+
+- `aapl_control_input`: processed inputs for the original package-based Apple
+
+  control-shock benchmark;
+
+- `aapl_onestep_input`: ready-to-use inputs for the modular one-step Apple
+
+  control-shock example;
+
+- `iyg_onestep_input`: ready-to-use inputs for the IYG one-step volatility
+
+  forecasting application, including the `all`, `restricted`, and
+
+  `elections_only` donor-pool specifications.
+
+Each object is documented in the package help files and can be loaded with
+
+`data(<object_name>)`.
+
+## Construction of the Analysis Panel
+
+Let \( P_t \) denote the nominal closing price of the target asset (AAPL or COP) at trading day \( t \). 
+
+We treat \( \{P_t\} \) as a univariate time series and perform \(k\)-step-ahead forecasting using time-series models (e.g., ARIMA or ARIMAX). One-day-ahead forecasting corresponds to \(k = 1\), where predictions of \(P_{t+1}\) are generated using information available up to time \(t\).
+
+Covariates observed at time \(t\), denoted by \(X_t\), consist of macro-financial variables aligned on the same trading day. These covariates are used either in donor weighting (DBW) or as exogenous regressors in ARIMAX-type models. Temporal alignment is handled internally by the forecasting procedure, and no manual lead construction is required at the data storage stage.
+
+To study structural breaks, we extract fixed-length shock windows around each event date. Each window consists of \(T_{\text{pre}}\) pre-shock observations and \(T_{\text{post}}\) post-shock observations. The shock day is defined as the first post-shock observation within each window.
+
+## Localized Inflation Adjustment
+
+To ensure comparability across historical donor episodes occurring in different macroeconomic environments (e.g., 2008 or 2014), we apply a localized inflation adjustment.
+
+Let \( \overline{\text{CPI}}_y \) denote the annual average CPI level for calendar year \(y\). Taking 2020 as the base year, we define the adjustment factor
+
+\[
+\text{adj}_y = \frac{\overline{\text{CPI}}_{2020}}{\overline{\text{CPI}}_y}.
+\]
+
+When a shock window is extracted for year \(y\), all price and covariate variables within that window are rescaled as
+
+\[
+W_y^{\text{real}} = W_y^{\text{nom}} \times \text{adj}_y.
+\]
+
+This adjustment converts all windows into 2020-dollar units while preserving within-window dynamics. Importantly, the inflation scaling is applied locally at the window level rather than globally across the full sample. This ensures that donor shock magnitudes are comparable in real terms to the 2020 target episode.
+
+The inflation-adjusted windows are stored in the distributed datasets and serve as the inputs to the synthetic forecasting procedure.
+
+```{r data-objects, eval=FALSE}
+data("cop_oil_postshock")
+data("aapl_control_input")
+# Use ?cop_oil_postshock and ?aapl_control_input interactively
+# to inspect the packaged data documentation.
+```
+
+# Simulation Study
+
+In this section we provide a targeted simulation study to illustrate how the proposed postshock forecasting framework behaves in controlled settings. The purpose of these simulations is not to deliver a comprehensive benchmark over all possible designs, but rather to verify that the adjustment mechanisms behave as expected under stylized postshock data-generating processes. We consider one set of simulations for the postshock mean equation and one for the postshock volatility equation.
+
+All simulations were implemented in R. The R Markdown files `sim-test.Rmd` (mean equation) and `sim_vol_test.Rmd` (volatility equation) are stored in the `technical_report` folder and reproduce the examples, figures, and summary tables reported in this section.
+
+## Targeted simulation for the postshock mean equation
+
+### Design
+
+For the mean equation, we use a stylized postshock simulation setup designed to mirror the empirical forecasting problem while remaining simple and interpretable. In each simulation, we generate one target series and two donor series over 200 time points, with a known shock occurring at time index 150. We focus on one-step-ahead postshock forecasting.
+
+The donor series are constructed to differ in their similarity to the target. One donor is generated by adding only small Gaussian noise to the target path and is therefore closely aligned with the target in the pre-shock period. The second donor is generated with substantially larger noise and is intentionally less aligned. This allows us to assess whether the weighting mechanism places greater emphasis on the more informative donor.
+
+The mean simulations implemented in `sim-test.Rmd` consider two complementary design blocks. In the first block, we study covariate informativeness by constructing one informative covariate together with additional noisy covariates. The informative covariate is generated from a common latent signal with small perturbations, whereas the noisy covariates are generated independently as random-walk-type processes. This design is used to examine how forecast performance changes as the covariate set becomes less informative.
+
+In the second block, we study several representative postshock patterns: a one-period local jump, a persistent level shift, and a volatility-type disturbance added after the shock date. These scenarios are designed to check whether the proposed adjustment procedure responds in the expected direction under simple but interpretable departures from the pre-shock trajectory.
+
+Throughout, the shock date and local window structure are treated as known.
+
+### Forecasting procedures and evaluation criteria
+
+For each simulated design, we construct the target and donor series together with their aligned covariates and pass them to `SynthPrediction()` using the same basic workflow as in the empirical application. We focus on one-step-ahead postshock prediction (\(k = 1\)).
+
+We compare three forecasts for the target series:
+
+1. **Unadjusted forecast.**  
+   The baseline ARIMA/ARIMAX model is fitted using only the pre-shock segment of the target series, and the one-step-ahead postshock prediction is obtained without any donor-based shock adjustment.
+
+2. **Arithmetic-mean adjusted forecast.**  
+   The baseline prediction is augmented by the simple average of the estimated donor shock effects.
+
+3. **DBW-adjusted forecast.**  
+   The baseline prediction is augmented by a donor-balancing-weights (DBW) combination of the estimated donor shock effects, where the donor weights are chosen to better match the target’s pre-shock covariate environment.
+
+Performance is assessed by comparing the predicted postshock value with the realized postshock value of the target series. In the covariate-sensitivity experiments, we summarize forecast errors and predicted-versus-realized values across alternative covariate designs. In the shock-pattern experiments, we compare the direction and magnitude of the forecast adjustments under different stylized postshock scenarios.
+
+### Reproducibility
+
+The complete implementation of the mean-equation simulation study is provided in `sim-test.Rmd` in the `technical_report` folder. The main text reports only the representative designs and summary results.
+```{r mean_sim_round23_results, echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE, fig.width=8, fig.height=5}
+library(xts)
+library(ggplot2)
+library(knitr)
+
+# =========================
+# Round 2: Data generation
+# =========================
+set.seed(123)
+
+dates <- seq.Date(
+  from = as.Date("2021-01-01"),
+  by   = "day",
+  length.out = 200
+)
+
+y0_values <- cumsum(rnorm(200, mean = 0, sd = 1)) + 100
+Y0 <- xts(y0_values, order.by = dates)
+
+y1_values <- y0_values + rnorm(200, mean = 0, sd = 0.1)
+Y1 <- xts(y1_values, order.by = dates)
+
+y2_values <- y0_values + rnorm(200, mean = 0, sd = 2)
+Y2 <- xts(y2_values, order.by = dates)
+
+Y_series_list <- list(Y0, Y1, Y2)
+
+# Construct corresponding covariate series X0, X1, X2
+base_signal <- cumsum(rnorm(200, mean = 0, sd = 1))
+
+X0_values <- base_signal + rnorm(200, mean = 0, sd = 0.1)
+X1_values <- base_signal + rnorm(200, mean = 0, sd = 0.1)
+X2_values <- cumsum(rnorm(200, mean = 0, sd = 2))
+
+X0 <- xts(X0_values, order.by = dates)
+X1 <- xts(X1_values, order.by = dates)
+X2 <- xts(X2_values, order.by = dates)
+
+shock_time_vec   <- c(150, 150, 150)
+shock_length_vec <- c(1, 1, 1)
+
+covariates_series_list <- list(X0, X1, X2)
+
+# Optional sanity call, kept here to match your original workflow
+res_with_cov <- SynthPrediction(
+  Y_series_list          = Y_series_list,
+  covariates_series_list = covariates_series_list,
+  shock_time_vec         = shock_time_vec,
+  shock_length_vec       = shock_length_vec,
+  k                      = 1,
+  covariate_indices      = 1,
+  seasonal               = FALSE,
+  plots                  = FALSE
+)
+
+# ==========================================
+# Round 3: Covariate sensitivity experiment
+# ==========================================
+set.seed(123)
+
+len   <- nrow(Y_series_list[[1]])
+dates <- index(Y_series_list[[1]])
+
+generate_covariates <- function(k) {
+  base_signal <- cumsum(rnorm(len))
+  mat <- sapply(seq_len(k), function(j) {
+    if (j == 1) {
+      base_signal + rnorm(len, 0, 0.1)
+    } else {
+      cumsum(rnorm(len, 0, 3))
+    }
+  })
+  xts(mat, order.by = dates)
+}
+
+abs_error <- function(pred, truth) {
+  p <- as.numeric(pred)
+  t <- as.numeric(truth)
+  abs(p - t)
+}
+
+results  <- list()
+error_df <- data.frame()
+value_df <- data.frame()
+
+for (k in c(1, 3, 5)) {
+
+  cov_list <- lapply(seq_along(Y_series_list), function(i) generate_covariates(k))
+
+  res <- SynthPrediction(
+    Y_series_list          = Y_series_list,
+    covariates_series_list = cov_list,
+    shock_time_vec         = shock_time_vec,
+    shock_length_vec       = shock_length_vec,
+    k                      = 1,
+    covariate_indices      = 1:k,
+    seasonal               = FALSE,
+    plots                  = FALSE,
+    penalty_lambda         = 1e-4,
+    penalty_normchoice     = "l2"
+  )
+
+  true_val  <- as.numeric(Y_series_list[[1]][shock_time_vec[1] + 1])
+  arima_val <- as.numeric(res$predictions$unadjusted)
+  synth_val <- as.numeric(res$predictions$adjusted)
+  mean_val  <- as.numeric(res$predictions$arithmetic_mean)
+
+  err_arima <- abs_error(arima_val, true_val)
+  err_synth <- abs_error(synth_val, true_val)
+  err_mean  <- abs_error(mean_val,  true_val)
+
+  results[[paste0("k_", k)]] <- list(
+    error_arima    = err_arima,
+    error_synth    = err_synth,
+    error_mean_adj = err_mean,
+    weights        = res$linear_combinations,
+    true_value     = true_val,
+    pred_arima     = arima_val,
+    pred_synth     = synth_val,
+    pred_mean      = mean_val
+  )
+
+  error_df <- rbind(
+    error_df,
+    data.frame(k = k, Method = "ARIMA",           Error = err_arima),
+    data.frame(k = k, Method = "Arithmetic mean", Error = err_mean),
+    data.frame(k = k, Method = "DBW adjusted",    Error = err_synth)
+  )
+
+  value_df <- rbind(
+    value_df,
+    data.frame(k = k, Method = "True value",      Value = true_val),
+    data.frame(k = k, Method = "ARIMA",           Value = arima_val),
+    data.frame(k = k, Method = "Arithmetic mean", Value = mean_val),
+    data.frame(k = k, Method = "DBW adjusted",    Value = synth_val)
+  )
+}
+
+knitr::kable(
+  error_df,
+  digits = 3,
+  caption = "Absolute forecast error across alternative covariate designs."
+)
+
+ggplot(error_df, aes(x = factor(k), y = Error, group = Method, shape = Method)) +
+  geom_line() +
+  geom_point(size = 3) +
+  labs(
+    title = "Forecast error under different numbers of covariates",
+    x = "Number of covariates",
+    y = "Absolute error"
+  ) +
+  theme_minimal()
+
+knitr::kable(
+  value_df,
+  digits = 3,
+  caption = "True and predicted postshock values across covariate designs."
+)
+
+ggplot(value_df, aes(x = factor(k), y = Value, group = Method, shape = Method)) +
+  geom_line() +
+  geom_point(size = 3) +
+  labs(
+    title = "Predicted versus true postshock values",
+    x = "Number of covariates",
+    y = "Postshock value"
+  ) +
+  theme_minimal()
+```
+
+
+## Simulation for the volatility equation
+
+### Estimators and evaluation criteria
+
+For each simulated data set, we first use `auto_garchx()` to select a GARCHX-type specification for each series by BIC, allowing for both symmetric and asymmetric (GJR-type) variance dynamics. The selected model may then be refitted using the backcast-based stabilization step implemented in `auto_garchx()`. Based on these fitted pre-shock volatility models, we apply `SynthVolForecast()` to construct postshock variance forecasts for the target series.
+
+In the volatility simulations reported here, we compare two forecasts for the target variance:
+
+1. **Unadjusted volatility forecast.**  
+   A pre-shock GARCHX-type model selected by `auto_garchx()` is fitted to the target series, and its postshock conditional variance forecast is extrapolated without donor-based correction.
+
+2. **DBW-adjusted volatility forecast.**  
+   The unadjusted variance forecast is augmented by a donor-based postshock adjustment, where donor shock effects are combined using donor balancing weights constructed from pre-shock volatility features.
+
+Performance is evaluated by comparing the predicted conditional variance with the true conditional variance generated by the simulation design. In the representative omega-jump design, we report step-by-step true variance, raw forecast, adjusted forecast, and their corresponding absolute forecast errors over the short postshock horizon.
+
+### Results
+
+The representative volatility simulation under the omega-jump design shows that the unadjusted pre-shock GARCH-type forecast tends to underreact to the increase in conditional variance after the shock. In contrast, the DBW-adjusted forecast moves closer to the true postshock variance over the short forecast horizon.
+
+Table 3 reports the step-by-step true conditional variance together with the raw and DBW-adjusted forecasts. The figure below visualizes the same comparison and shows that the DBW-adjusted path tracks the true variance more closely than the raw baseline forecast.
+
+These results are consistent with the intended role of the synthetic volatility module: when donor episodes are weighted according to pre-shock similarity in volatility features, donor information can improve short-horizon postshock variance forecasting relative to a purely pre-shock GARCH-type extrapolation.
+
+```{r volatility_sim_results, echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+library(garchx)
+library(zoo)
+library(ggplot2)
+library(knitr)
+
+# ====== 1) Simulation: GJR-GARCH(1,1) with an omega jump ======
+sim_gjr_omega_jump <- function(n, t0,
+                               omega = 0.02, d_omega = 0.06,
+                               alpha = 0.07, beta = 0.80, gamma = 0.25,
+                               seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  stopifnot(alpha + beta + 0.5 * gamma < 1)
+
+  z <- rnorm(n)
+  h <- e <- numeric(n)
+
+  h[1] <- omega / (1 - alpha - beta - 0.5 * gamma)
+  e[1] <- sqrt(h[1]) * z[1]
+
+  for (t in 2:n) {
+    omega_t <- if (t > t0) omega + d_omega else omega
+    Ineg <- as.numeric(e[t - 1] < 0)
+
+    h[t] <- omega_t +
+      alpha * e[t - 1]^2 +
+      gamma * Ineg * e[t - 1]^2 +
+      beta  * h[t - 1]
+
+    e[t] <- sqrt(h[t]) * z[t]
+  }
+
+  list(y = e, h = h)
+}
+
+# ====== 2) DBW feature construction ======
+make_dbw_features <- function(y, L = 10) {
+  v2 <- y^2
+
+  msq5  <- rollapplyr(v2,  5, mean, partial = TRUE)
+  msq10 <- rollapplyr(v2, 10, mean, partial = TRUE)
+  msq20 <- rollapplyr(v2, 20, mean, partial = TRUE)
+  vol10 <- rollapplyr(y, 10, sd, partial = TRUE)
+
+  lag_one <- function(x, k) {
+    if (k == 0) x else c(rep(x[1], k), x[1:(length(x) - k)])
+  }
+
+  lag_block <- sapply(0:(L - 1), function(k) lag_one(v2, k))
+  colnames(lag_block) <- paste0("v2_lag", 0:(L - 1))
+
+  as.data.frame(cbind(msq5, msq10, msq20, vol10, lag_block))
+}
+
+# ====== 3) Generate target + donors ======
+set.seed(2025)
+n  <- 1600
+t0 <- 1200
+
+tar <- sim_gjr_omega_jump(n, t0, d_omega = 0.06)
+d1  <- sim_gjr_omega_jump(n, t0, d_omega = 0.08)
+d2  <- sim_gjr_omega_jump(n, t0, d_omega = 0.04)
+d3  <- sim_gjr_omega_jump(n, t0, d_omega = 0.02)
+
+Y_series_list <- list(tar$y, d1$y, d2$y, d3$y)
+
+target_covariates      <- make_dbw_features(tar$y, L = 10)
+covariates_series_list <- lapply(Y_series_list[-1], make_dbw_features, L = 10)
+
+shock_time_vec   <- rep(as.integer(t0), length(Y_series_list))
+shock_length_vec <- vapply(
+  Y_series_list,
+  function(y) pmax(1L, as.integer(length(y) - as.integer(t0))),
+  integer(1L)
+)
+
+# ====== 4) Run SynthVolForecast over a short postshock horizon ======
+k <- 2
+
+res <- SynthVolForecast(
+  Y_series_list          = Y_series_list,
+  covariates_series_list = covariates_series_list,
+  target_covariates      = target_covariates,
+  shock_time_vec         = shock_time_vec,
+  shock_length_vec       = shock_length_vec,
+  k                      = k,
+  dbw_indices            = 1:ncol(target_covariates),
+  covariate_indices      = NULL,
+  max.p = 3, max.q = 3,
+  plots = FALSE
+)
+
+true_var <- tar$h[(t0 + 1):(t0 + k)]
+pred_raw <- as.numeric(res$predictions$unadjusted)
+pred_adj <- as.numeric(res$predictions$adjusted)
+
+vol_df <- data.frame(
+  Step = seq_len(k),
+  `True variance` = round(true_var, 6),
+  `Raw forecast` = round(pred_raw, 6),
+  `DBW-adjusted forecast` = round(pred_adj, 6),
+  `Raw absolute error` = round(abs(pred_raw - true_var), 6),
+  `Adjusted absolute error` = round(abs(pred_adj - true_var), 6)
+)
+
+knitr::kable(
+  vol_df,
+  digits = 6,
+  caption = "Volatility simulation summary for the omega-jump design."
+)
+
+plot_df <- rbind(
+  data.frame(Step = seq_len(k), Series = "True variance", Value = true_var),
+  data.frame(Step = seq_len(k), Series = "Raw forecast", Value = pred_raw),
+  data.frame(Step = seq_len(k), Series = "DBW-adjusted forecast", Value = pred_adj)
+)
+
+ggplot(plot_df, aes(x = Step, y = Value, group = Series, shape = Series)) +
+  geom_line() +
+  geom_point(size = 3) +
+  labs(
+    title = "True versus predicted variance under the omega-jump design",
+    x = "Horizon step",
+    y = "Variance"
+  ) +
+  theme_minimal()
+```
+
+## Discussion
+
+The simulation studies for the postshock mean and volatility components provide controlled settings in which the underlying shock effects and conditional moments are known. In these settings, the unadjusted baseline forecasts tend to underreact to structural changes because they are estimated using only pre-shock information and therefore extrapolate the pre-shock dynamics too smoothly into the postshock period.
+
+For the mean component, incorporating donor information can improve postshock prediction, but the quality of the adjustment depends on how well the donor episodes resemble the target in the pre-shock period. The targeted simulations show that simple unweighted adjustments can become less stable when donor series or covariates are noisy, whereas the DBW-based adjustment remains more robust by placing greater emphasis on donors that are better aligned with the target.
+
+For the volatility component, the representative omega-jump designs show a similar pattern. The unadjusted pre-shock GARCH-type variance forecast tends to underpredict the postshock increase in conditional variance, while the DBW-adjusted forecast tracks the true postshock variance more closely over the short forecast horizon. This supports the use of pre-shock volatility features for donor weighting in the synthetic volatility module.
+
+Taken together, these simulation results support the role of donor balancing weights as a general device for improving postshock forecasting in both the mean and volatility settings. They also provide a controlled complement to the empirical analysis in the next section, where the same workflow is applied to the ConocoPhillips case study.
+
+
+# Empirical Application: ConocoPhillips under Large Shocks
+
+In this section we apply the postshock forecasting framework developed in Sections 2–3 to the ConocoPhillips (COP) data set described in Section 4. The goal is to forecast COP around large negative shocks by borrowing information from earlier donor shock episodes that occurred under different market conditions. We treat the COVID-19 oil price collapse in March 2020 as the target episode and use several earlier crisis episodes as donors.
+
+## Target and donor shock episodes
+
+We focus on the large negative shock to ConocoPhillips on 9 March 2020 as the target episode. In the implementation we follow the convention of Section 3 and treat the last pre-shock trading day as the index \(T_0\). For the March 2020 event this corresponds to 6 March 2020, so the shock itself occurs between \(T_0\) and \(T_0 + 1\).
+
+As donor episodes we select five earlier crisis windows for COP. These correspond to the March 2008 Bear Stearns episode, three major September 2008 crisis episodes during the Lehman and bailout turmoil, and the late-November 2014 OPEC-related oil price collapse. For each episode we construct a local window of 30 trading days before \(T_0\) and 30 trading days after the shock, and we work with inflation-adjusted prices expressed in 2020 U.S. dollars, as described in Section 4.
+## Empirical implementation using the packaged data object
+
+To keep the empirical workflow fully reproducible and consistent with the package interface, we use the processed object `cop_oil_postshock` distributed with the package rather than reconstructing the windows manually in the main text. This object contains the aligned target and donor shock windows, the corresponding macro-financial covariate matrices, and the shock timing metadata required by the forecasting functions.
+
+In particular, `cop_oil_postshock` stores the outcome series in `Y`, the aligned covariate matrices in `X`, the covariate names in `covar_names`, and the local shock timing information in `shock_time_vec` and `shock_length_vec`. The empirical analysis therefore follows the same workflow as the general package implementation and can be reproduced directly from the processed object.
+
+Using the same processed object, we next examine whether separating donor episodes into multiple pools provides a more interpretable or more accurate postshock adjustment for the March 2020 COP episode.
+
+```{r cop-empirical-call, echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+library(ggplot2)
+library(knitr)
+data("cop_oil_postshock")
+
+out_cop <- SynthPrediction(
+  Y_series_list          = cop_oil_postshock$Y,
+  covariates_series_list = cop_oil_postshock$X,
+  shock_time_vec         = cop_oil_postshock$shock_time_vec,
+  shock_length_vec       = cop_oil_postshock$shock_length_vec,
+  k                      = 1,
+  covariate_indices      = NULL,
+  seasonal               = TRUE,
+  use_dbw                = TRUE,
+  plots                  = FALSE
+)
+
+forecast_df <- data.frame(
+  Method = c("Actual", "Unadjusted", "Arithmetic mean", "DBW adjusted"),
+  Value  = c(
+    as.numeric(cop_oil_postshock$Y[[1]][cop_oil_postshock$shock_time_vec[1] + 1]),
+    as.numeric(out_cop$predictions$unadjusted),
+    as.numeric(out_cop$predictions$arithmetic_mean),
+    as.numeric(out_cop$predictions$adjusted)
+  )
+)
+
+knitr::kable(
+  forecast_df,
+  digits = 3,
+  caption = "Forecast comparison for the March 2020 COP shock episode."
+)
+
+weight_df <- data.frame(
+  Donor = names(cop_oil_postshock$Y)[-1],
+  Weight = as.numeric(out_cop$linear_combinations)
+)
+
+knitr::kable(
+  weight_df,
+  digits = 3,
+  caption = "DBW donor weights for the COP empirical application."
+)
+
+target_y <- as.numeric(cop_oil_postshock$Y[[1]])
+shock_t0 <- cop_oil_postshock$shock_time_vec[1]
+pred_day <- shock_t0 + 1
+
+plot_df <- data.frame(
+  Day = 1:pred_day,
+  COP = target_y[1:pred_day]
+)
+
+forecast_points <- data.frame(
+  Day = c(pred_day, pred_day - 0.15, pred_day + 0.15, pred_day + 0.30),
+  Method = factor(
+    c("Actual", "Unadjusted", "Arithmetic mean", "DBW adjusted"),
+    levels = c("Actual", "Unadjusted", "Arithmetic mean", "DBW adjusted")
+  ),
+  Value = c(
+    as.numeric(target_y[pred_day]),
+    as.numeric(out_cop$predictions$unadjusted),
+    as.numeric(out_cop$predictions$arithmetic_mean),
+    as.numeric(out_cop$predictions$adjusted)
+  )
+)
+
+ggplot() +
+  geom_line(data = plot_df, aes(x = Day, y = COP), color = "black") +
+  geom_point(data = plot_df, aes(x = Day, y = COP), color = "black") +
+  geom_point(
+    data = forecast_points,
+    aes(x = Day, y = Value, color = Method, shape = Method),
+    size = 3
+  ) +
+  scale_color_manual(values = c(
+    "Actual" = "black",
+    "Unadjusted" = "red",
+    "Arithmetic mean" = "blue",
+    "DBW adjusted" = "darkgreen"
+  )) +
+  labs(
+    title = "COP path up to the forecast date with postshock forecast comparison",
+    x = "Day in local shock window",
+    y = "COP price"
+  ) +
+  theme_minimal()
+```
+
+## MultiPool extension
+
+### Motivation
+
+The single-pool donor adjustment treats all historical donor episodes as belonging to a common donor set. In the COP application, however, this may be restrictive because the March 2020 collapse plausibly reflected multiple channels, including oil-market supply disruptions and broader demand or financial-stress effects. A MultiPool extension allows these channels to be represented separately by grouping donor episodes into economically interpretable pools and aggregating their contributions afterwards.
+
+### Pool definition
+
+Using the same COP shock windows as in the baseline empirical analysis, we partition the donor episodes into two pools. The late-November 2014 episode is assigned to a **supply** pool because it is naturally associated with the OPEC-related oil-price collapse. The March and September 2008 episodes are assigned to a **demand** pool, as they are more closely associated with crisis-driven market stress and demand contraction.
+
+Formally, the pool structure is specified as
+\[
+\texttt{pools} =
+\{\texttt{supply} = (\texttt{Y\_2014\_11\_28}),\;
+\texttt{demand} = (\texttt{Y\_2008\_03\_17}, \texttt{Y\_2008\_09\_09}, \texttt{Y\_2008\_09\_15}, \texttt{Y\_2008\_09\_29})\}.
+\]
+
+### MultiPool implementation
+
+We apply the MultiPool version of `SynthPrediction()` using the same aligned COP outcome and covariate series as in the baseline case. In this experiment, donor balancing weights are applied within each pool (`pool_use_dbw = TRUE`), while the baseline target forecast is kept as the unweighted ARIMA/ARIMAX component (`base_use_dbw = FALSE`).
+
+We consider two aggregation rules across pools:
+
+1. **Sum aggregation** (`pool_agg = "sum"`), which adds the estimated pool-level shock effects;
+2. **Weighted aggregation** (`pool_agg = "weighted"`), which combines the pool-level shock effects using user-specified pool weights.
+
+This comparison allows us to assess whether separating supply-side and demand-side donor pools yields a more interpretable or more accurate postshock adjustment than the single-pool specification.
+```{r cop-multipool-call, echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+library(knitr)
+
+pre_len  <- 30L
+post_len <- 1L
+k <- 1L
+
+Y_series_list          <- cop_oil_postshock$Y
+covariates_series_list <- cop_oil_postshock$X
+
+shock_time_vec   <- rep(pre_len,  length(Y_series_list))
+shock_length_vec <- rep(post_len, length(Y_series_list))
+
+pools <- list(
+  supply = c("Y_2014_11_28"),
+  demand = c("Y_2008_03_17", "Y_2008_09_09", "Y_2008_09_15", "Y_2008_09_29")
+)
+
+# MultiPool with additive aggregation
+out_sum <- SynthPrediction(
+  Y_series_list          = Y_series_list,
+  covariates_series_list = covariates_series_list,
+  shock_time_vec         = shock_time_vec,
+  shock_length_vec       = shock_length_vec,
+  k                      = k,
+  pools                  = pools,
+  pool_agg               = "sum",
+  base_use_dbw           = FALSE,
+  pool_use_dbw           = TRUE,
+  plots                  = FALSE
+)
+
+# MultiPool with weighted aggregation
+out_wsum <- SynthPrediction(
+  Y_series_list          = Y_series_list,
+  covariates_series_list = covariates_series_list,
+  shock_time_vec         = shock_time_vec,
+  shock_length_vec       = shock_length_vec,
+  k                      = k,
+  pools                  = pools,
+  pool_agg               = "weighted",
+  pool_weights           = c(supply = 0.9, demand = 0.9),
+  base_use_dbw           = FALSE,
+  pool_use_dbw           = TRUE,
+  plots                  = FALSE
+)
+
+multipool_df <- data.frame(
+  Method = c("Actual", "Unadjusted", "Single-pool DBW", "MultiPool (sum)", "MultiPool (weighted)"),
+  Value  = c(
+    as.numeric(cop_oil_postshock$Y[[1]][pre_len + 1]),
+    as.numeric(out_cop$predictions$unadjusted),
+    as.numeric(out_cop$predictions$adjusted),
+    as.numeric(out_sum$predictions$adjusted_multipool),
+    as.numeric(out_wsum$predictions$adjusted_multipool)
+  )
+)
+
+knitr::kable(
+  multipool_df,
+  digits = 3,
+  caption = "Forecast comparison for the COP empirical application under MultiPool specifications."
+)
+target_y <- as.numeric(cop_oil_postshock$Y[[1]])
+pred_day <- pre_len + 1L
+
+path_df <- data.frame(
+  Day = seq_len(pred_day),
+  Price = target_y[seq_len(pred_day)]
+)
+
+forecast_df <- data.frame(
+  Day = c(pred_day, pred_day + 0.10, pred_day + 0.20, pred_day + 0.30, pred_day + 0.40),
+  Method = factor(
+    c("Actual", "Unadjusted", "Single-pool DBW", "MultiPool (sum)", "MultiPool (weighted)"),
+    levels = c("Actual", "Unadjusted", "Single-pool DBW", "MultiPool (sum)", "MultiPool (weighted)")
+  ),
+  Value = c(
+    as.numeric(cop_oil_postshock$Y[[1]][pred_day]),
+    as.numeric(out_cop$predictions$unadjusted),
+    as.numeric(out_cop$predictions$adjusted),
+    as.numeric(out_sum$predictions$adjusted_multipool),
+    as.numeric(out_wsum$predictions$adjusted_multipool)
+  )
+)
+
+ggplot() +
+  geom_line(
+    data = path_df,
+    aes(x = Day, y = Price),
+    color = "grey55",
+    linewidth = 0.8
+  ) +
+  geom_point(
+    data = path_df,
+    aes(x = Day, y = Price),
+    color = "black",
+    size = 2
+  ) +
+  geom_point(
+    data = forecast_df,
+    aes(x = Day, y = Value, color = Method, shape = Method),
+    size = 3.2
+  ) +
+  scale_color_manual(values = c(
+    "Actual" = "black",
+    "Unadjusted" = "#F4A3A3",
+    "Single-pool DBW" = "#8DB6F2",
+    "MultiPool (sum)" = "#9ED9A3",
+    "MultiPool (weighted)" = "#C8A2E8"
+  )) +
+  scale_shape_manual(values = c(
+    "Actual" = 16,
+    "Unadjusted" = 17,
+    "Single-pool DBW" = 15,
+    "MultiPool (sum)" = 18,
+    "MultiPool (weighted)" = 3
+  )) +
+  labs(
+    title = "COP path up to the forecast date under single-pool and MultiPool specifications",
+    x = "Day in local shock window",
+    y = "COP price"
+  ) +
+  theme_minimal()
+```
+
+## Summary and discussion
+
+In this empirical section we applied the postshock forecasting framework to the ConocoPhillips data set using the processed package object `cop_oil_postshock`. The COVID-19 oil-price collapse of 9 March 2020 was treated as the target episode, while five earlier crisis windows from 2008 and 2014 served as donor episodes. The packaged object contains the aligned target and donor outcome series, the corresponding macro-financial covariate matrices, and the associated shock metadata, allowing the empirical workflow to be reproduced directly through the package interface.
+
+The baseline empirical results illustrate the contribution of donor information relative to the unadjusted ARIMAX forecast. The unadjusted forecast, obtained by extrapolating the pre-shock target dynamics without any donor-based correction, lies substantially above the realised COP price on the shock date. Both the arithmetic-mean adjustment and the DBW-adjusted forecast move closer to the realised value, with the DBW-adjusted version performing slightly better in this case. This supports the idea that reweighting donor episodes according to pre-shock similarity can improve postshock prediction relative to simple averaging.
+
+The MultiPool extension further enriches the empirical analysis by allowing donor episodes to be partitioned into economically interpretable groups. In the COP application, the donor episodes were separated into supply-related and demand-related pools, reflecting the view that the March 2020 collapse likely combined multiple transmission channels. The MultiPool results show that this extension can provide a more structured and interpretable decomposition of the postshock adjustment, while also yielding forecasts that are competitive with, and in this case slightly closer to the realised value than, the single-pool DBW forecast.
+
+Overall, the COP case study demonstrates that the proposed framework can transfer information from historical shock episodes to a new target event in a reproducible and modular way. The same package workflow can be adapted to alternative donor structures, additional pooling rules, or other financial and macroeconomic time series, making the framework flexible for a broad class of postshock forecasting problems.
+
+# Empirical Application: IYG Volatility around the 2016 U.S. Election
+
+## Empirical setting and evaluation target
+
+This section illustrates the use of `SynthVolForecast()` on a real-data volatility forecasting problem. The target episode is the 2016 U.S. election, and the target asset is IYG, a financial-sector ETF. The goal is to evaluate whether donor post-shock volatility behavior from related historical events can improve a one-step-ahead post-shock variance forecast.
+
+Because the latent conditional variance is not directly observed in real financial data, evaluation is based on the next-day squared return of the target series. The forecasts reported below are variance forecasts, while the visualization uses a square-root volatility-proxy scale for readability.
+
+## Candidate donor pools
+
+The experiment uses the package data object `iyg_onestep_input`, which contains three ready-to-use donor-pool specifications: `all`, `restricted`, and `elections_only`.
+
+```{r iyg-load-data, echo=FALSE, message=FALSE, warning=FALSE}
+
+data("iyg_onestep_input")
+
+names(iyg_onestep_input$inputs)
+
+```
+
+We compare three analyst-specified donor-pool choices. The `all` pool includes all candidate donor episodes and serves as a broad benchmark. The `restricted` pool keeps the 2012 Election, Brexit Poll Released, and Brexit episodes, which are intended to be more comparable political-uncertainty shocks. The `elections_only` pool uses only previous U.S. presidential elections, providing a same-event-type benchmark.
+
+```{r iyg-donor-pools-table, echo=FALSE, message=FALSE, warning=FALSE}
+
+iyg_pool_table <- data.frame(
+
+  Donor_Pool = c("All donors", "Restricted", "Elections only"),
+
+  Donor_Episodes = c(
+
+    paste(iyg_onestep_input$inputs$all$donor_events, collapse = ", "),
+
+    paste(iyg_onestep_input$inputs$restricted$donor_events, collapse = ", "),
+
+    paste(iyg_onestep_input$inputs$elections_only$donor_events, collapse = ", ")
+
+  ),
+
+  check.names = FALSE
+
+)
+
+knitr::kable(
+
+  iyg_pool_table,
+
+  caption = "Donor-pool specifications for the IYG volatility application."
+
+)
+
+```
+
+The donor-pool definitions are treated as analyst-specified inputs rather than being selected ex post based on forecast accuracy. This design allows the application to evaluate how different substantive choices about donor comparability affect the resulting volatility adjustment.
+
+## Package workflow
+
+For each donor-pool specification, the packaged object provides the complete input required by `SynthVolForecast()`: the target and donor return series, the donor covariate series, the target covariates used for DBW matching, and the aligned shock-time metadata. The same function call is then applied to each donor pool.
+
+```{r iyg-run-restricted, echo=FALSE, message=FALSE, warning=FALSE}
+
+iyg_restricted <- iyg_onestep_input$inputs$restricted
+
+svf_out_restricted <- SynthVolForecast(
+
+  Y_series_list = iyg_restricted$Y_series_list,
+
+  covariates_series_list = iyg_restricted$covariates_series_list,
+
+  target_covariates = iyg_restricted$target_covariates,
+
+  shock_time_vec = iyg_restricted$shock_time_vec,
+
+  shock_length_vec = iyg_restricted$shock_length_vec,
+
+  k = 1,
+
+  dbw_indices = 1:ncol(iyg_restricted$target_covariates),
+
+  covariate_indices = NULL,
+
+  plots = FALSE,
+
+  return_fits = TRUE,
+
+  max.p = 3,
+
+  max.q = 3,
+
+  vcov.type = "robust"
+
+)
+
+```
+
+```{r iyg-run-all-and-elections, echo=FALSE, message=FALSE, warning=FALSE}
+
+iyg_all <- iyg_onestep_input$inputs$all
+
+svf_out_all <- SynthVolForecast(
+
+  Y_series_list = iyg_all$Y_series_list,
+
+  covariates_series_list = iyg_all$covariates_series_list,
+
+  target_covariates = iyg_all$target_covariates,
+
+  shock_time_vec = iyg_all$shock_time_vec,
+
+  shock_length_vec = iyg_all$shock_length_vec,
+
+  k = 1,
+
+  dbw_indices = 1:ncol(iyg_all$target_covariates),
+
+  covariate_indices = NULL,
+
+  plots = FALSE,
+
+  return_fits = TRUE,
+
+  max.p = 3,
+
+  max.q = 3,
+
+  vcov.type = "robust"
+
+)
+
+iyg_elections <- iyg_onestep_input$inputs$elections_only
+
+svf_out_elec <- SynthVolForecast(
+
+  Y_series_list = iyg_elections$Y_series_list,
+
+  covariates_series_list = iyg_elections$covariates_series_list,
+
+  target_covariates = iyg_elections$target_covariates,
+
+  shock_time_vec = iyg_elections$shock_time_vec,
+
+  shock_length_vec = iyg_elections$shock_length_vec,
+
+  k = 1,
+
+  dbw_indices = 1:ncol(iyg_elections$target_covariates),
+
+  covariate_indices = NULL,
+
+  plots = FALSE,
+
+  return_fits = TRUE,
+
+  max.p = 3,
+
+  max.q = 3,
+
+  vcov.type = "robust"
+
+)
+
+```
+
+## Forecast comparison across donor-pool specifications
+
+The observed next-day squared return is used as the realized-variance proxy for
+
+evaluating the one-step-ahead variance forecast.
+
+```{r iyg-results-table, echo=FALSE, message=FALSE, warning=FALSE}
+
+target_reaction_proxy <- as.numeric(
+
+  iyg_restricted$Y_series_list[[1]][
+
+    iyg_onestep_input$evaluation$proxy_index
+
+  ]^2
+
+)
+
+iyg_results <- data.frame(
+
+  Specification = c("Restricted", "Elections only", "All donors"),
+
+  Unadjusted = c(
+
+    as.numeric(svf_out_restricted$predictions$unadjusted),
+
+    as.numeric(svf_out_elec$predictions$unadjusted),
+
+    as.numeric(svf_out_all$predictions$unadjusted)
+
+  ),
+
+  `DBW adjusted` = c(
+
+    as.numeric(svf_out_restricted$predictions$adjusted),
+
+    as.numeric(svf_out_elec$predictions$adjusted),
+
+    as.numeric(svf_out_all$predictions$adjusted)
+
+  ),
+
+  `Arithmetic mean` = c(
+
+    as.numeric(svf_out_restricted$predictions$arithmetic_mean),
+
+    as.numeric(svf_out_elec$predictions$arithmetic_mean),
+
+    as.numeric(svf_out_all$predictions$arithmetic_mean)
+
+  ),
+
+  check.names = FALSE
+
+)
+
+iyg_results$`Observed proxy` <- target_reaction_proxy
+
+iyg_results$`AE DBW` <- abs(iyg_results$`DBW adjusted` - target_reaction_proxy)
+
+iyg_results$`AE arithmetic` <- abs(iyg_results$`Arithmetic mean` - target_reaction_proxy)
+
+knitr::kable(
+
+  iyg_results,
+
+  digits = 6,
+
+  caption = "One-step post-shock variance forecasts for IYG under alternative donor-pool specifications."
+
+)
+
+```
+
+The unadjusted GARCH forecast is much smaller than the realized-variance proxy, suggesting that the pre-shock target volatility model alone does not fully capture the post-shock volatility response. Donor-based adjustment substantially raises the one-step variance forecast. Among the three donor-pool specifications, the restricted pool produces the closest DBW-adjusted forecast to the realized variance proxy. The elections-only pool under-adjusts, while the full donor pool improves relative to the raw forecast but is less accurate than the restricted pool.
+
+The table reports forecasts on the variance scale. The following figure plots the same forecast-day comparison on a square-root volatility-proxy scale, together with the local absolute-return path of the target episode.
+
+```{r iyg-volatility-comparison-plot, echo=FALSE, warning=FALSE, message=FALSE, fig.width=9, fig.height=5}
+
+target_y <- as.numeric(iyg_restricted$Y_series_list[[1]])
+
+shock_idx <- iyg_restricted$shock_time_vec[1]
+
+forecast_idx <- shock_idx + 1L
+
+hist_idx <- (forecast_idx - 30L):forecast_idx
+
+hist_df <- data.frame(
+
+  day = seq_along(hist_idx),
+
+  value = abs(target_y[hist_idx])
+
+)
+
+compare_df <- data.frame(
+
+  day = c(31, 31.08, 31.16, 31.24, 31.32),
+
+  value = c(
+
+    abs(target_y[forecast_idx]),
+
+    sqrt(as.numeric(svf_out_restricted$predictions$unadjusted)),
+
+    sqrt(as.numeric(svf_out_restricted$predictions$adjusted)),
+
+    sqrt(as.numeric(svf_out_elec$predictions$adjusted)),
+
+    sqrt(as.numeric(svf_out_all$predictions$adjusted))
+
+  ),
+
+  type = factor(
+
+    c(
+
+      "Observed",
+
+      "Unadjusted",
+
+      "Adjusted (restricted)",
+
+      "Adjusted (elections only)",
+
+      "Adjusted (all donors)"
+
+    ),
+
+    levels = c(
+
+      "Observed",
+
+      "Unadjusted",
+
+      "Adjusted (restricted)",
+
+      "Adjusted (elections only)",
+
+      "Adjusted (all donors)"
+
+    )
+
+  )
+
+)
+
+ggplot() +
+
+  geom_line(
+
+    data = hist_df,
+
+    aes(x = day, y = value),
+
+    color = "black",
+
+    linewidth = 0.5
+
+  ) +
+
+  geom_point(
+
+    data = hist_df,
+
+    aes(x = day, y = value),
+
+    color = "black",
+
+    size = 2
+
+  ) +
+
+  geom_point(
+
+    data = compare_df,
+
+    aes(x = day, y = value, color = type, shape = type),
+
+    size = 3.5
+
+  ) +
+
+  scale_color_manual(values = c(
+
+    "Observed" = "black",
+
+    "Unadjusted" = "mediumpurple",
+
+    "Adjusted (restricted)" = "tomato",
+
+    "Adjusted (elections only)" = "steelblue4",
+
+    "Adjusted (all donors)" = "firebrick4"
+
+  )) +
+
+  scale_shape_manual(values = c(
+
+    "Observed" = 16,
+
+    "Unadjusted" = 18,
+
+    "Adjusted (restricted)" = 16,
+
+    "Adjusted (elections only)" = 17,
+
+    "Adjusted (all donors)" = 15
+
+  )) +
+
+  scale_x_continuous(
+
+    breaks = c(1, 10, 20, 30, 31),
+
+    labels = c("1", "10", "20", "30", "Forecast"),
+
+    limits = c(1, 31.45)
+
+  ) +
+
+  labs(
+
+    title = "IYG local volatility trend and forecast-day comparison",
+
+    x = "Day in local shock window",
+
+    y = "Volatility proxy scale",
+
+    color = NULL,
+
+    shape = NULL
+
+  ) +
+
+  theme_minimal(base_size = 12) +
+
+  theme(
+
+    panel.grid.minor = element_blank(),
+
+    legend.position = "right"
+
+  )
+
+```
+
+## Discussion
+
+Taken together, the IYG results suggest that donor-pool composition matters primarily through the magnitude of the implied post-shock volatility uplift. All three donor-pool specifications produce adjusted forecasts above the unadjusted GARCH baseline, indicating that donor information consistently contributes a positive short-horizon volatility correction.
+
+At the same time, the results show that a broader donor pool is not automatically preferable. The full donor pool includes more historical episodes, but this can dilute the adjustment when less comparable episodes receive positive weight. The elections-only pool is transparent from an event-type perspective, but it does not generate a sufficiently large volatility adjustment in this case. The restricted pool balances event comparability and broader political-uncertainty relevance, and it produces the closest DBW-adjusted forecast to the realized variance proxy.
+
+This application complements the simulation study by showing that the same donor-based variance-adjustment logic can be applied to a real financial volatility setting using the packaged `iyg_onestep_input` object. It also illustrates that the software is useful not only for producing forecasts after a donor pool has been specified, but also for comparing how different substantive
+donor-pool choices affect the resulting post-shock volatility adjustment.
+
+# Empirical Extension: Apple in the Presence of Control Shocks
+
+The Apple example is presented here as a modular validation exercise for the package. In particular, it illustrates that when the target window is short and a fully automatic time-series baseline is less appealing, the package can still be used effectively for donor-side shock-effect estimation, donor balancing weights (DBW), and control-shock regressor construction. Rather than relying on a single end-to-end automatic forecasting routine, this experiment combines a user-specified target-side baseline with the package’s donor-side adjustment machinery.
+
+## Motivation and empirical setting
+
+Apple provides a useful case study because product-release events often generate stock-price movements that may be confounded by broader market forces. In such settings, the observed postshock movement in the target series need not be attributable solely to the event of interest. Instead, it may reflect both an event-specific component and a more general background movement. This motivates a control-shock formulation, in which the forecasting procedure attempts to isolate the event-related adjustment while explicitly controlling for an additional non-target shock.
+
+Following the general validation logic of the Apple case study, we treat one Apple event window as the target episode and use several earlier Apple-related windows as donor episodes. The donor windows are chosen to reflect similar event environments while still allowing heterogeneity in the realized postshock responses. As in the ConocoPhillips application, the windows are locally aligned and the variables are inflation-adjusted before analysis.
+
+## Empirical implementation using the packaged data object
+
+To keep the experiment reproducible, we use the packaged object aapl_onestep_input. This object stores the processed target and donor inputs required for the one-step Apple control-shock experiment. In particular, it contains the aligned target and donor outcome series, the donor-weighting covariate series, the local shock-timing information, the target baseline window, and the key dates needed for the control-shock specification.
+
+This empirical extension should not be viewed as an exact reproduction of the original Apple experiment. Instead, it is designed to show how the package can still be used when the target-side baseline is replaced by a simpler and more natural local regression. In the present setup, the donor-side shock effects and DBW weights are obtained from the package machinery, while the target-side forecast is produced by a one-step regression model using the observed values on 2020-11-10 to predict the Apple closing price on 2020-11-11.
+
+More specifically, the target-side baseline is a one-step local regression of the next-day Apple closing price on the current Apple closing price, the contemporaneous S&P 500 level, the contemporaneous 13-week Treasury bill rate, and a control-shock dummy. The control-shock regressor is constructed using the package helper build_control_xreg(), so the control-shock extension remains fully integrated with the package’s data-handling conventions even though the target-side baseline is user-specified rather than fully automatic.
+
+On the donor side, the package is used to estimate donor shock effects and to compute DBW weights. These donor effects are then aggregated into a weighted adjustment and added to the baseline forecast. We also report a simple mean-adjustment benchmark based on the unweighted average donor effect. This allows us to compare the contribution of the donor-weighting step to the final forecast improvement.
+```{r,echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+if (!exists("aapl_onestep_input")) {
+  load("../../data/aapl_onestep_input.rda")
+}
+
+Y_series_list     <- aapl_onestep_input$Y_series_list
+X_for_dbw         <- aapl_onestep_input$X_for_dbw
+shock_time_vec    <- aapl_onestep_input$shock_time_vec
+shock_length_vec  <- aapl_onestep_input$shock_length_vec
+Z_tgt_base        <- aapl_onestep_input$Z_tgt_base
+control_shock_day <- aapl_onestep_input$control_shock_day
+target_day        <- aapl_onestep_input$target_day
+
+out_pkg <- SynthPrediction(
+  Y_series_list = Y_series_list,
+  covariates_series_list = X_for_dbw,
+  shock_time_vec = shock_time_vec,
+  shock_length_vec = shock_length_vec,
+  k = 1,
+  use_dbw = TRUE,
+  dbw_indices = 1:2,
+  covariate_indices = NULL,
+  arima_order = NULL,
+  seasonal = FALSE,
+  control_shocks = NULL,
+  dbw_center = TRUE,
+  dbw_scale = TRUE,
+  days_before_shocktime_vec = 10L,
+  plots = FALSE
+)
+
+omega_vec      <- as.numeric(out_pkg$meta$omega_vec)
+omega_combined <- as.numeric(out_pkg$meta$combined_omega)
+
+n_base <- nrow(Z_tgt_base)
+
+train_dat <- data.frame(
+  Y    = as.numeric(Z_tgt_base[2:n_base, "AAPL"]),
+  lagY = as.numeric(Z_tgt_base[1:(n_base - 1), "AAPL"]),
+  GSPC = as.numeric(Z_tgt_base[1:(n_base - 1), "GSPC"]),
+  IRX  = as.numeric(Z_tgt_base[1:(n_base - 1), "IRX"])
+)
+
+idx_ctrl <- which(as.Date(index(Z_tgt_base))[1:(n_base - 1)] == control_shock_day)
+
+C_train <- build_control_xreg(
+  last = nrow(train_dat),
+  control_spec = list(
+    list(time = as.integer(idx_ctrl), length = 1L, shape = "point")
+  )
+)
+
+train_dat <- cbind(train_dat, as.data.frame(C_train))
+
+fit_base <- lm(Y ~ lagY + GSPC + IRX + ctrl_shock_1, data = train_dat)
+
+newdata_1110 <- data.frame(
+  lagY = as.numeric(Z_tgt_base[n_base, "AAPL"]),
+  GSPC = as.numeric(Z_tgt_base[n_base, "GSPC"]),
+  IRX  = as.numeric(Z_tgt_base[n_base, "IRX"]),
+  ctrl_shock_1 = 0
+)
+
+yhat_base  <- as.numeric(predict(fit_base, newdata = newdata_1110))
+yhat_dbw   <- yhat_base + omega_combined
+yhat_equal <- yhat_base + mean(omega_vec)
+y_true     <- as.numeric(Y_series_list[[1]][shock_time_vec[1]])
+cat("yhat_base: ", yhat_base, "\n")
+cat("yhat_dbw: ", yhat_dbw, "\n")
+cat("yhat_equal: ", yhat_equal, "\n")
+
+```
+```{r aapl-onestep-plot, echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+library(ggplot2)
+
+aapl_target_y <- as.numeric(Y_series_list[[1]])
+aapl_n <- length(aapl_target_y)
+
+plot_df <- data.frame(
+  Day = seq_len(aapl_n),
+  Price = aapl_target_y
+)
+
+forecast_df <- data.frame(
+  Day = c(shock_time_vec[1], shock_time_vec[1] + 0.18, shock_time_vec[1] + 0.36),
+  Value = c(y_true, yhat_base, yhat_dbw),
+  Label = c("Truth", "Baseline", "Baseline + DBW"),
+  x_text = c(shock_time_vec[1] + 0.9, shock_time_vec[1] + 0.9, shock_time_vec[1] + 0.9),
+  y_text = c(y_true + 0.45, yhat_base - 0.35, yhat_dbw + 0.85)
+)
+
+ggplot(plot_df, aes(Day, Price)) +
+  geom_line(color = "grey65", linewidth = 0.6) +
+  geom_point(color = "black", size = 1.2) +
+  geom_point(
+    data = forecast_df[forecast_df$Label == "Truth", ],
+    aes(Day, Value),
+    color = "black",
+    shape = 16,
+    size = 2.2
+  ) +
+  geom_point(
+    data = forecast_df[forecast_df$Label == "Baseline", ],
+    aes(Day, Value),
+    color = "#e78ac3",
+    shape = 16,
+    size = 2.2
+  ) +
+  geom_point(
+    data = forecast_df[forecast_df$Label == "Baseline + DBW", ],
+    aes(Day, Value),
+    color = "#1f78b4",
+    shape = 17,
+    size = 2.6
+  ) +
+  geom_segment(
+    data = forecast_df,
+    aes(x = Day, y = Value, xend = x_text - 0.08, yend = y_text),
+    color = "grey40",
+    linewidth = 0.4
+  ) +
+  geom_text(
+    data = forecast_df,
+    aes(x = x_text, y = y_text, label = Label),
+    hjust = 0,
+    size = 3.5
+  ) +
+  coord_cartesian(
+    xlim = c(aapl_n - 8, aapl_n + 3),
+    ylim = c(
+      min(c(tail(aapl_target_y, 8), yhat_base, yhat_dbw, y_true)) - 1,
+      max(c(tail(aapl_target_y, 8), yhat_base, yhat_dbw, y_true)) + 1.4
+    )
+  ) +
+  labs(
+    title = "Apple one-step forecast near the target date",
+    x = "Day",
+    y = "Closing stock price"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5)
+  )
+```
+
+## Results
+The Apple control-shock example shows that the package remains useful even when the target-side baseline is replaced by a simpler one-step local regression. In this experiment, the one-step baseline forecast for Apple on 2020-11-11 is 119.023, while the DBW-adjusted forecast is 119.481 and the mean-adjustment benchmark is 119.721. The realized closing price is 119.490.
+
+The baseline forecast therefore underpredicts the target value, whereas the donor-side adjustment substantially improves accuracy. In particular, the DBW-adjusted forecast is nearly identical to the realized value, with only a very small residual error. The mean-adjustment benchmark also improves on the raw baseline, but it is less accurate than the DBW-based adjustment.
+
+This result is important because the Apple example is not used here as an exact replication of the original paper’s implementation. Instead, it serves as a modular validation exercise. The target-side baseline is replaced by a more natural one-step regression, while the package continues to provide donor-side shock effects, DBW weighting, and control-shock regressors. The strong performance of the adjusted forecast suggests that the donor-side adjustment machinery remains effective even when the automatic target-side baseline is not used.
+
+### Forecast Comparison Under the Original Package-Based Apple Control-Shock Specification
+```{r aapl-controlshock-call, echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+library(knitr)
+library(ggplot2)
+
+data("aapl_control_input")
+
+Y_series_list          <- aapl_control_input$Y
+covariates_series_list <- aapl_control_input$X
+shock_time_vec         <- aapl_control_input$shock_time_vec
+shock_length_vec       <- aapl_control_input$shock_length_vec
+
+# control shock specification for the target window
+# replace this with the exact local index you want to use
+control_shocks <- list(
+  list(time = 10L, length = 1L, shape = "point")
+)
+
+out_aapl <- SynthPrediction(
+  Y_series_list            = Y_series_list,
+  covariates_series_list   = covariates_series_list,
+  shock_time_vec           = shock_time_vec,
+  shock_length_vec         = shock_length_vec,
+  k                        = 1,
+  use_dbw                  = TRUE,
+  dbw_indices              = 1:2,
+  covariate_indices        = NULL,
+  seasonal                 = FALSE,
+  control_shocks           = control_shocks,
+  dbw_center               = TRUE,
+  dbw_scale                = TRUE,
+  days_before_shocktime_vec = 10L,
+  plots                    = FALSE
+)
+
+actual_aapl <- as.numeric(
+  Y_series_list[[1]][shock_time_vec[1] + 1]
+)
+
+aapl_result_df <- data.frame(
+  Method = c("Actual", "Unadjusted", "Adjusted"),
+  Value  = c(
+    actual_aapl,
+    as.numeric(out_aapl$predictions$unadjusted),
+    as.numeric(out_aapl$predictions$adjusted)
+  )
+)
+
+knitr::kable(
+  aapl_result_df,
+  digits = 3,
+  caption = "Forecast comparison for the Apple control-shock experiment."
+)
+
+```
+
+ 
+```{r aapl-plot-data, echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+# target path
+aapl_target_y <- as.numeric(Y_series_list[[1]])
+aapl_n <- length(aapl_target_y)
+
+# actual value at the forecast horizon
+actual_aapl <- as.numeric(
+  Y_series_list[[1]][shock_time_vec[1] + 1]
+)
+
+# predictions
+aapl_unadjusted <- as.numeric(out_aapl$predictions$unadjusted)
+aapl_adjusted   <- as.numeric(out_aapl$predictions$adjusted)
+
+# main path data
+aapl_path_df <- data.frame(
+  Day = seq_len(aapl_n),
+  Price = aapl_target_y
+)
+
+# forecast points at the horizon
+aapl_forecast_df <- data.frame(
+  Day = c(
+    shock_time_vec[1] + 1,
+    shock_time_vec[1] + 1.10,
+    shock_time_vec[1] + 1.20
+  ),
+  Method = factor(
+    c("True value", "Unadjusted", "Adjusted"),
+    levels = c("True value", "Unadjusted", "Adjusted")
+  ),
+  Value = c(
+    actual_aapl,
+    aapl_unadjusted,
+    aapl_adjusted
+  )
+)
+
+ggplot() +
+  geom_line(
+    data = aapl_path_df,
+    aes(x = Day, y = Price),
+    color = "#e78ac3",
+    linewidth = 0.8
+  ) +
+  geom_point(
+    data = aapl_path_df,
+    aes(x = Day, y = Price),
+    color = "black",
+    size = 1.8
+  ) +
+  geom_point(
+    data = aapl_forecast_df,
+    aes(x = Day, y = Value, color = Method, shape = Method),
+    size = 3
+  ) +
+  scale_color_manual(values = c(
+    "True value" = "black",
+    "Unadjusted" = "#e78ac3",
+    "Adjusted" = "#1f78b4"
+  )) +
+  scale_shape_manual(values = c(
+    "True value" = 16,
+    "Unadjusted" = 16,
+    "Adjusted" = 3
+  )) +
+  labs(
+    title = "Apple target window with postshock forecast comparison",
+    x = "Day",
+    y = "Closing stock price"
+  ) +
+  theme_minimal()
+```
+The original fully automatic package-based Apple control-shock experiment is no longer used as the main empirical specification here. Instead, it is treated as a benchmark, while the main text focuses on the modular one-step implementation based on aapl_onestep_input.
+
+
+# Conclusion
+
+This technical report developed a modular postshock forecasting framework for time series with structural breaks in both mean and volatility. The framework combines donor-based adjustment, synthetic weighting, and flexible extensions for more complex empirical settings.
+
+The simulation studies show that donor-based adjustment improves postshock forecasting relative to unadjusted benchmarks, and that the DBW mechanism is especially useful when donor episodes differ in their pre-shock covariate environments. In the volatility setting, the framework also extends naturally to postshock variance prediction through GARCHX-type modeling.
+
+The IYG volatility application further shows that the same donor-based adjustment logic can be used for real-data variance forecasting. In that example, the restricted donor pool produces the closest one-step variance forecast to the realized variance proxy, highlighting that donor-pool composition matters for volatility adjustment.
+
+The empirical case studies highlight two complementary forms of flexibility. In the ConocoPhillips application, the framework improves upon the unadjusted benchmark and can be further enriched through the MultiPool extension, which groups donor episodes into economically interpretable channels. In the Apple example, the control-shock formulation shows that the same forecasting core can also be applied when the observed postshock response is interpreted in the presence of an additional background component.
+
+Taken together, these results show that the package is not limited to a single fixed application template. Instead, it supports a reproducible and modular workflow that can be adapted to alternative donor structures, different economic mechanisms, and richer interpretations of postshock behavior. Possible future work includes broader real-data volatility applications, additional pooling schemes, and further extensions of the control-shock framework.
+
+
+# References
+
+Kilian, Lutz (2009). “Not All Oil Price Shocks Are Alike: Disentangling Demand and Supply Shocks in the Crude Oil Market.” American Economic Review, 99(3), 1053–1069.
+
+Lin, Jilei, and Daniel J. Eck (2021). “Minimizing Post-Shock Forecasting Error through Aggregation of Outside Information.” International Journal of Forecasting, 37(4), 1710–1727. https://doi.org/10.1016/j.ijforecast.2021.03.010
+
+Sucarrat, Genaro (2021). “garchx: Flexible and Robust GARCH-X Modelling.” The R Journal, 13(1), 276–291.
