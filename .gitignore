@@ -48,3 +48,4 @@ po/*~
 # RStudio Connect folder
 rsconnect/
 inst/notes/lin2021minimizing.pdf
+.DS_Store
