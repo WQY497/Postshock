@@ -1,0 +1,1019 @@
+---
+title: "Post-Shock Forecasting Workflow"
+output:
+  rmarkdown::html_vignette:
+    toc: true
+vignette: >
+  %\VignetteIndexEntry{Post-Shock Forecasting Workflow}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+```{r setup, message=FALSE, warning=FALSE,include=FALSE}
+library(postshock)
+
+```
+
+# Overview
+
+The donor-adjustment framework builds on the post-shock forecasting approach
+of Lin and Eck (2021).
+
+Large structural shocks can cause forecasting models fitted only to pre-shock data to perform poorly in the post-shock period. The **postshock** package provides a donor-based forecasting framework that
+uses information from historical shock episodes to adjust forecasts following
+a new shock to the target series.
+
+The package supports forecasting of both conditional mean and volatility dynamics. Its main components are:
+
+- `dbw()`, which constructs donor balancing weights using pre-shock features;
+- `SynthPrediction()`, which produces donor-adjusted post-shock mean forecasts;
+- the MultiPool extension of `SynthPrediction()`, which organizes donors into
+  interpretable shock groups;
+- `auto_garchx()`, which selects GARCH-X orders using an information
+  criterion;
+- `SynthVolForecast()`, which produces donor-adjusted post-shock conditional
+  variance forecasts using GARCH-X models.
+
+The general workflow is:
+
+1. define a target episode and a collection of historical donor episodes;
+2. align the target and donors relative to their shock times;
+3. compare their pre-shock characteristics and estimate donor weights;
+4. estimate donor-specific post-shock effects; and
+5. add the weighted donor effect to a baseline forecast for the target.
+
+This vignette demonstrates the main package workflows using processed data
+objects distributed with **postshock**. We first illustrate post-shock mean
+forecasting using the ConocoPhillips example, then introduce the structured
+donor-pool extension, and finally demonstrate post-shock volatility forecasting
+using the IYG example.
+
+# Package data structure
+
+The forecasting functions in **postshock** operate on collections of target
+and donor series aligned relative to their respective shock times. At the
+function interface, the target and donor series are supplied through
+`Y_series_list`, with the target stored in the first position and the
+historical donors stored in the remaining positions.
+
+Each series has its own shock-timing information:
+
+- `shock_time_vec` records the last pre-shock observation for each series;
+- `shock_length_vec` defines the post-shock window length associated with each
+  series; for donor series, this window is used to estimate the corresponding
+  shock effect.
+
+The covariate structure differs between the two forecasting workflows:
+
+- `SynthPrediction()` uses `covariates_series_list`, whose elements are aligned
+  with the target and donor series in `Y_series_list`;
+- `SynthVolForecast()` uses `covariates_series_list` for donor covariates only,
+  while target covariates are supplied separately through
+  `target_covariates`.
+
+The ordering of the series, covariate inputs, shock times, and shock lengths
+must remain consistent within the relevant workflow. Entries representing the
+same target or donor episode must be correctly aligned.
+
+The `cop_oil_postshock` object follows the mean-forecasting structure. Its
+target and donor series are stored in `Y`, while their corresponding covariate
+matrices are stored in `X`.
+
+The list names do not need to be identical across `Y` and `X`, but they should
+clearly identify the corresponding episodes. For example, `Y_2008_03_17` and
+`X_2008_03_17` contain the series and covariate matrix associated with the same
+historical shock episode.
+
+This vignette uses two processed data objects distributed with the package:
+
+- `cop_oil_postshock`, for post-shock mean forecasting; and
+- `iyg_onestep_input`, for post-shock variance forecasting.
+
+Additional processed objects for the Apple control-shock examples are also
+available in the package.
+
+We begin with the ConocoPhillips data object.
+
+```{r load-cop-data}
+data("cop_oil_postshock", package = "postshock")
+
+names(cop_oil_postshock)
+```
+
+The target and donor series are stored in `Y`, while their corresponding
+covariate matrices are stored in `X`.
+
+```{r inspect-cop-data}
+cop_structure <- data.frame(
+  Position = seq_along(cop_oil_postshock$Y),
+  Series = names(cop_oil_postshock$Y),
+  Covariates = names(cop_oil_postshock$X),
+  Shock_time = cop_oil_postshock$shock_time_vec,
+  Shock_length = cop_oil_postshock$shock_length_vec
+)
+
+knitr::kable(
+  cop_structure,
+  caption = "Alignment of the target and donor inputs in `cop_oil_postshock`."
+)
+```
+
+The first element represents the target episode, and the remaining elements
+represent historical donor episodes. For every series, `shock_time_vec`
+identifies the last observation in the pre-shock period, so the shock effect
+begins at the following observation.
+
+# Donor balancing weights with `dbw()`
+
+Historical donor episodes are not necessarily equally informative for a new
+target shock. The function `dbw()` constructs donor balancing weights using
+characteristics observed before the shock.
+
+The function compares the target's pre-shock feature vector with weighted
+combinations of the donor feature vectors. Donors that provide a closer
+pre-shock match can therefore receive larger weights.
+
+A commonly used specification constrains the donor weights to be nonnegative
+and sum to one. Under this specification, the weights can be interpreted as
+the contribution of each donor to a synthetic donor combination.
+
+For the ConocoPhillips example, we use all available covariate columns and
+an L2-regularized balancing specification.
+
+```{r fit-cop-dbw, results='hide', message=FALSE, warning=FALSE}
+cop_dbw <- dbw(
+  X = cop_oil_postshock$X,
+  dbw_indices = seq_len(ncol(cop_oil_postshock$X[[1]])),
+  shock_time_vec = cop_oil_postshock$shock_time_vec,
+  center = TRUE,
+  scale = TRUE,
+  sum_to_1 = TRUE,
+  bounded_below_by = 0,
+  bounded_above_by = 1,
+  normchoice = "l2",
+  penalty_normchoice = "l2",
+  penalty_lambda = 1e-2
+)
+```
+
+The returned object contains the estimated donor weights, the final balancing
+loss, and the optimizer convergence result.
+
+```{r inspect-cop-dbw}
+names(cop_dbw)
+
+cop_dbw$convergence
+cop_dbw$loss
+sum(cop_dbw$opt_params)
+```
+The convergence result indicates whether the numerical optimization completed
+successfully. The loss measures the remaining discrepancy between the target
+features and the weighted donor features under the selected scaling and
+regularization specification. It is primarily useful for comparing alternative
+DBW specifications fitted to the same data.
+
+The donor weights are stored in `opt_params`.
+
+```{r display-cop-dbw}
+cop_weight_table <- data.frame(
+  Donor = sub(
+    "^Y_",
+    "",
+    names(cop_oil_postshock$Y)[-1]
+  ),
+  Weight = as.numeric(cop_dbw$opt_params)
+)
+
+knitr::kable(
+  cop_weight_table,
+  digits = 3,
+  caption = "Donor balancing weights for the ConocoPhillips example."
+)
+```
+
+The estimated weights sum to one, up to numerical precision. In this example,
+most of the weight is assigned to the 2014-11-28 and 2008-09-29 episodes,
+while the remaining donor episodes receive weights close to zero. Under the
+selected pre-shock covariates and balancing specification, these two episodes
+therefore provide the main contribution to the synthetic donor combination.
+
+These weights determine how donor-specific shock effects are combined. They
+should not be interpreted as probabilities that particular historical events
+will recur.
+
+In most applications, users do not need to call `dbw()` separately.
+`SynthPrediction()` and `SynthVolForecast()` can call it internally when
+donor-based weighting is requested. A direct call is nevertheless useful for
+examining the pre-shock match and understanding which donors contribute to the
+synthetic adjustment.
+
+# Mean forecasting with `SynthPrediction()`
+
+
+`SynthPrediction()` produces post-shock mean forecasts by combining a
+baseline forecast for the target series with estimated post-shock effects from
+historical donor episodes.
+
+The procedure has four main steps. First, an ARIMA or ARIMAX model containing
+a post-shock indicator is fitted to each donor series. The coefficient of this
+indicator represents the estimated post-shock shift for that donor. Second,
+the donor-specific shifts are combined using either equal weights or donor
+balancing weights. Third, a baseline model is fitted to the target using only
+its pre-shock observations. Finally, the combined donor shift is added to the
+target baseline forecast.
+
+The function returns three forecast versions:
+
+- `unadjusted`, the target baseline forecast without a donor adjustment;
+- `arithmetic_mean`, the baseline forecast adjusted by the simple average of
+  the donor-specific post-shock effects; and
+- `adjusted`, the baseline forecast adjusted by the DBW-weighted donor effect.
+
+## ConocoPhillips example
+
+The target episode is the large decline in the ConocoPhillips (`COP`) share
+price in March 2020. Five earlier crisis and oil-market episodes are used as
+donors. The aligned series, covariates, and shock timing information are stored
+in the `cop_oil_postshock` object loaded in the previous section.
+
+## Fit a one-step post-shock forecast
+
+We set `k = 1` to forecast the first observation after the target's pre-shock
+period. The call below uses the same feature columns, centering and scaling choices,
+and L2 penalty as the direct `dbw()` example above.
+
+The covariate matrices are used to construct donor weights. Because
+`covariate_indices = NULL`, they are not included as regressors in the ARIMA
+models. In that case, each donor model contains the post-shock indicator, while
+the target baseline is fitted without covariate regressors.
+
+```{r fit-cop-synthprediction, results='hide', message=FALSE, warning=FALSE}
+cop_fit <- SynthPrediction(
+  Y_series_list = cop_oil_postshock$Y,
+  covariates_series_list = cop_oil_postshock$X,
+  shock_time_vec = cop_oil_postshock$shock_time_vec,
+  shock_length_vec = cop_oil_postshock$shock_length_vec,
+  k = 1L,
+  dbw_indices = seq_len(ncol(cop_oil_postshock$X[[1]])),
+  dbw_center = TRUE,
+  dbw_scale = TRUE,
+  use_dbw = TRUE,
+  covariate_indices = NULL,
+  seasonal = TRUE,
+  penalty_lambda = 1e-2,
+  penalty_normchoice = "l2"
+)
+```
+
+Setting `seasonal = TRUE` allows the function to consider a seasonal
+specification when a meaningful seasonal frequency is detected. It does not
+require every fitted model to contain a seasonal component.
+
+## Inspect forecasts
+
+The returned object has three main components. `predictions` contains the
+forecast versions, `linear_combinations` contains the donor weights, and
+`meta` contains donor-specific effects and model information.
+
+```{r inspect-cop-fit}
+names(cop_fit)
+names(cop_fit$predictions)
+names(cop_fit$meta)
+```
+## Compare the forecasts
+
+The first post-shock observation occurs at the index immediately following the
+last pre-shock observation of the target.
+
+```{r cop-forecast-comparison}
+forecast_index <- cop_oil_postshock$shock_time_vec[1] + 1L
+
+observed_value <- as.numeric(
+  cop_oil_postshock$Y[[1]][forecast_index]
+)
+
+forecast_values <- c(
+  as.numeric(cop_fit$predictions$unadjusted[1]),
+  as.numeric(cop_fit$predictions$arithmetic_mean[1]),
+  as.numeric(cop_fit$predictions$adjusted[1])
+)
+
+cop_forecast_table <- data.frame(
+  Method = c(
+    "Observed value",
+    "Unadjusted",
+    "Arithmetic mean",
+    "DBW adjusted"
+  ),
+  Value = c(
+    observed_value,
+    forecast_values
+  ),
+  Absolute_error = c(
+    NA_real_,
+    abs(forecast_values - observed_value)
+  )
+)
+
+knitr::kable(
+  cop_forecast_table,
+  digits = 3,
+  col.names = c("Method", "Value", "Absolute error"),
+  caption = paste(
+    "One-step forecast comparison for the March 2020",
+    "ConocoPhillips shock episode."
+  )
+)
+```
+
+The observed value is included only for retrospective evaluation. It is not
+supplied to `SynthPrediction()` when the target model or donor weights are
+estimated.
+
+As shown in the table, both donor-adjusted forecasts reduce the absolute error
+relative to the unadjusted baseline. The DBW-adjusted forecast also has a
+smaller error than the arithmetic-mean adjustment in this example.
+
+The improvement over the unadjusted baseline is substantial, whereas the
+additional gain from DBW weighting over equal weighting is more modest.
+Because the comparison is based on a single retrospective one-step forecast,
+it should be interpreted as an illustration of the workflow rather than
+general evidence that DBW always performs better.
+
+## Inspect donor weights and the combined adjustment
+
+The donor weights used by `SynthPrediction()` are stored in
+`linear_combinations`. The estimated donor-specific post-shock effects are
+stored in `meta$omega_vec`.
+
+```{r inspect-cop-donor-results}
+cop_donor_summary <- data.frame(
+  Donor = sub(
+    "^Y_",
+    "",
+    names(cop_oil_postshock$Y)[-1]
+  ),
+  Weight = as.numeric(cop_fit$linear_combinations),
+  Estimated_effect = as.numeric(cop_fit$meta$omega_vec)
+)
+
+knitr::kable(
+  cop_donor_summary,
+  digits = 3,
+  col.names = c(
+    "Donor",
+    "DBW weight",
+    "Estimated post-shock effect"
+  ),
+  caption = "Donor weights and estimated effects for the COP example."
+)
+```
+
+Donors with weights close to zero make little contribution to the final
+adjustment, even when their estimated post-shock effects are relatively large,
+whereas donors with larger weights have greater influence.
+
+```{r inspect-cop-adjustment}
+data.frame(
+  Unadjusted_forecast =
+    as.numeric(cop_fit$predictions$unadjusted[1]),
+  Combined_donor_effect =
+    as.numeric(cop_fit$meta$combined_omega),
+  Adjusted_forecast =
+    as.numeric(cop_fit$predictions$adjusted[1])
+) |>
+  knitr::kable(
+    digits = 3,
+    col.names = c(
+      "Unadjusted forecast",
+      "Combined donor effect",
+      "DBW-adjusted forecast"
+    ),
+    caption = "Construction of the DBW-adjusted COP forecast."
+  )
+```
+
+The sign of the combined donor effect determines the direction of the
+adjustment. In this example, the combined effect is negative, so it lowers the
+unadjusted forecast and moves it closer to the observed post-shock value.
+
+# Structured donor pools
+
+A single-pool analysis treats all historical donor episodes as members of one
+common donor set. In some applications, however, donor shocks may represent
+different economic mechanisms. The MultiPool extension allows donors to be
+organized into interpretable groups before their estimated adjustments are
+aggregated.
+
+For the ConocoPhillips example, we separate the donor episodes into two
+channels:
+
+- a `supply` pool containing the November 2014 oil-price shock; and
+- a `demand` pool containing the crisis-related episodes from 2008.
+
+These classifications are specified by the analyst and should reflect the
+economic mechanisms underlying the historical events. Numerical pre-shock
+characteristics are used later to construct donor weights within each pool.
+
+## Define the donor pools
+
+Pools are supplied as a named list. Each element contains donor names that
+must match the corresponding entries in `names(Y_series_list)`.
+
+```{r define-cop-pools}
+cop_pools <- list(
+  supply = "Y_2014_11_28",
+  demand = c(
+    "Y_2008_03_17",
+    "Y_2008_09_09",
+    "Y_2008_09_15",
+    "Y_2008_09_29"
+  )
+)
+
+cop_pool_table <- data.frame(
+  Pool = names(cop_pools),
+  Donors = unname(
+    vapply(
+      cop_pools,
+      function(x) {
+        paste(
+          gsub("_", "-", sub("^Y_", "", x)),
+          collapse = ", "
+        )
+      },
+      character(1)
+    )
+  )
+)
+
+knitr::kable(
+  cop_pool_table,
+  row.names = FALSE,
+  col.names = c("Pool", "Donor episodes"),
+  caption = "Structured donor pools for the ConocoPhillips example."
+)
+```
+
+The first element of `Y_series_list` is always treated as the target.
+Only donor names should therefore be included in `pools`; the target is added
+automatically when each pool-specific model is fitted.
+
+## Fit the MultiPool specification
+
+Providing the `pools` argument causes `SynthPrediction()` to use the MultiPool
+extension. The function retains a common unadjusted target forecast and
+estimates a separate donor adjustment within each pool.
+
+Here, `pool_use_dbw = TRUE` applies donor balancing within each pool. Because
+the supply pool contains only one donor, its within-pool weight is necessarily
+one. Donor balancing primarily affects the multi-donor demand pool.
+
+```{r fit-cop-multipool, results='hide', message=FALSE, warning=FALSE}
+cop_multipool <- SynthPrediction(
+  Y_series_list = cop_oil_postshock$Y,
+  covariates_series_list = cop_oil_postshock$X,
+  shock_time_vec = cop_oil_postshock$shock_time_vec,
+  shock_length_vec = cop_oil_postshock$shock_length_vec,
+  k = 1L,
+  covariate_indices = NULL,
+  seasonal = TRUE,
+  dbw_indices = seq_len(
+    ncol(cop_oil_postshock$X[[1]])
+  ),
+  dbw_center = TRUE,
+  dbw_scale = TRUE,
+  penalty_lambda = 1e-2,
+  penalty_normchoice = "l2",
+  pools = cop_pools,
+  pool_agg = "sum",
+  base_use_dbw = FALSE,
+  pool_use_dbw = TRUE
+)
+```
+
+With `pool_agg = "sum"`, the pool-specific adjustments are treated as
+additive components of the total post-shock adjustment. This is a modeling
+choice rather than a property automatically inferred from the data. Users
+can instead select `pool_agg = "weighted"` and provide a named numeric vector
+through `pool_weights`.
+
+## Inspect the pool-specific adjustments
+
+The estimated adjustment for each pool is stored in
+`meta$multi_pool$pool_effects`, while the aggregated adjustment is stored in
+`meta$multi_pool$aggregated_effect`.
+
+```{r inspect-cop-pool-effects}
+cop_pool_effects <- data.frame(
+  Pool = names(
+    cop_multipool$meta$multi_pool$pool_effects
+  ),
+  Estimated_adjustment = as.numeric(
+    cop_multipool$meta$multi_pool$pool_effects
+  )
+)
+
+knitr::kable(
+  cop_pool_effects,
+  row.names = FALSE,
+  digits = 3,
+  col.names = c(
+    "Pool",
+    "Estimated pool adjustment"
+  ),
+  caption = "Pool-specific adjustments for the ConocoPhillips example."
+)
+```
+
+The MultiPool-adjusted forecast is returned in
+`predictions$adjusted_multipool`.
+
+```{r compare-cop-multipool}
+cop_multipool_values <- c(
+  as.numeric(
+    cop_multipool$predictions$unadjusted[1]
+  ),
+  as.numeric(
+    cop_fit$predictions$adjusted[1]
+  ),
+  as.numeric(
+    cop_multipool$predictions$adjusted_multipool[1]
+  )
+)
+
+cop_multipool_table <- data.frame(
+  Method = c(
+    "Observed value",
+    "Unadjusted",
+    "Single-pool DBW",
+    "MultiPool (sum)"
+  ),
+  Value = c(
+    observed_value,
+    cop_multipool_values
+  ),
+  Absolute_error = c(
+    NA_real_,
+    abs(cop_multipool_values - observed_value)
+  )
+)
+
+knitr::kable(
+  cop_multipool_table,
+  digits = 3,
+  col.names = c("Method", "Value", "Absolute error"),
+  caption = paste(
+    "Comparison of single-pool and MultiPool forecasts",
+    "for the ConocoPhillips example."
+  )
+)
+```
+
+In this example, both pool-level effects lower the unadjusted forecast. Their
+sum produces the MultiPool adjustment and moves the forecast closer to the
+observed post-shock value.
+
+The result should be interpreted as an illustration of how economically
+meaningful donor groups can be represented in the package. A closer forecast
+in this single retrospective example does not imply that splitting donors
+into multiple pools will always improve forecasting performance.
+
+# Volatility forecasting with `SynthVolForecast()`
+
+`SynthVolForecast()` extends the donor-adjustment framework to conditional
+variance forecasting. It combines a baseline variance forecast fitted to the
+pre-shock target series with post-shock variance adjustments estimated from
+historical donor episodes.
+
+For each donor, the function fits a GARCH-X model containing a post-shock
+indicator in the conditional variance equation. The estimated coefficient of
+this indicator represents the donor-specific variance adjustment. These
+adjustments are then combined using donor balancing weights and added to the
+target's baseline variance forecast.
+
+The function returns three forecast versions:
+
+- `unadjusted`, the baseline conditional variance forecast;
+- `arithmetic_mean`, the baseline forecast adjusted by the simple average of
+  the donor-specific variance effects; and
+- `adjusted`, the baseline forecast adjusted by the DBW-weighted donor effect.
+
+Because conditional variance is latent in empirical financial data, forecast
+evaluation requires an observable proxy. In the example below, the next-period
+squared return is used as a realized-variance proxy.
+
+## Load the IYG example
+
+The target series is IYG, a financial-sector exchange-traded fund, and the
+target shock is the 2016 U.S. presidential election. Historical election and
+political-uncertainty episodes serve as potential donors.
+
+The processed inputs are distributed with **postshock** in the
+`iyg_onestep_input` object.
+
+```{r load-iyg-data}
+data("iyg_onestep_input", package = "postshock")
+
+names(iyg_onestep_input)
+names(iyg_onestep_input$inputs)
+```
+The object provides three analyst-defined donor-pool configurations:
+`all`, `restricted`, and `elections_only`. In this vignette, we use the
+`restricted` configuration to demonstrate the main workflow. The donor-pool
+choice is treated as part of the analysis design rather than selected using
+the realized forecast error.
+
+```{r inspect-iyg-input}
+iyg_restricted <- iyg_onestep_input$inputs$restricted
+
+names(iyg_restricted)
+```
+
+The restricted input contains the target and donor return series, the donor
+covariate matrices, a separate target covariate matrix, and the shock-timing
+vectors required by `SynthVolForecast()`.
+
+```{r summarize-iyg-input}
+iyg_restricted$target_event
+iyg_restricted$donor_events
+
+c(
+  number_of_series =
+    length(iyg_restricted$Y_series_list),
+  number_of_donors =
+    length(iyg_restricted$donor_events),
+  donor_covariate_sets =
+    length(iyg_restricted$covariates_series_list),
+  shock_time_entries =
+    length(iyg_restricted$shock_time_vec),
+  shock_length_entries =
+    length(iyg_restricted$shock_length_vec)
+)
+```
+The restricted configuration contains one target series and three donor
+series. The three donor covariate matrices correspond to the three donor
+episodes, while the shock-time and shock-length vectors contain one entry for
+every target or donor series.
+
+## Produce a variance forecast
+
+We use the `restricted` donor-pool configuration and produce a one-step-ahead
+conditional variance forecast. This configuration contains the 2012 Election,
+Brexit Poll Released, and Brexit donor episodes.
+
+The GARCH-X orders are selected automatically. With `garch_order = NULL`,
+`SynthVolForecast()` calls `auto_garchx()` separately for each donor and for
+the pre-shock target series. Candidate specifications are compared using BIC
+over GARCH orders up to `max.q = 3` and ARCH orders up to `max.p = 3`,
+including both symmetric and asymmetric specifications.
+
+Candidate fits must return without error, with a finite numeric scalar
+convergence code of zero, a nonempty finite real coefficient vector, and
+finite BIC. The eligible fit with the lowest BIC is selected; exact ties
+retain the first eligible candidate. If none qualifies, selection stops
+with an error. Non-finite standard errors alone do not exclude a fit.
+The optional backcast refit replaces the grid fit only if it meets the
+same conditions and strictly lowers BIC; otherwise the grid fit is retained.
+
+The donor covariates are used for DBW matching. Because
+`covariate_indices = NULL`, the donor-side variance models contain the
+post-shock indicator but do not include additional covariates as GARCH-X
+regressors.
+
+```{r fit-iyg-volatility, results='hide', message=FALSE, warning=FALSE}
+iyg_fit <- SynthVolForecast(
+  Y_series_list =
+    iyg_restricted$Y_series_list,
+  covariates_series_list =
+    iyg_restricted$covariates_series_list,
+  target_covariates =
+    iyg_restricted$target_covariates,
+  shock_time_vec =
+    iyg_restricted$shock_time_vec,
+  shock_length_vec =
+    iyg_restricted$shock_length_vec,
+  k = 1L,
+  dbw_indices = seq_len(
+    ncol(iyg_restricted$target_covariates)
+  ),
+  dbw_center = TRUE,
+  dbw_scale = TRUE,
+  penalty_lambda = 1e-2,
+  penalty_normchoice = "l2",
+  covariate_indices = NULL,
+  garch_order = NULL,
+  max.p = 3L,
+  max.q = 3L,
+  vcov.type = "robust",
+  return_fits = FALSE
+)
+```
+
+### Inspect the selected GARCH-X orders
+
+The automatically selected orders are stored separately for the donor models
+and the target model. The order is reported as `(q, p, o)`, where `q` is the
+GARCH order, `p` is the ARCH order, and `o` is the asymmetry order. The
+automatic search considers `o = 0` and `o = 1` by default.
+
+```{r inspect-iyg-orders}
+iyg_selected_orders <- do.call(
+  rbind,
+  c(
+    iyg_fit$meta$donor_orders,
+    list(iyg_fit$meta$target_order)
+  )
+)
+
+iyg_order_table <- data.frame(
+  Model = c(
+    paste("Donor:", iyg_restricted$donor_events),
+    paste("Target:", iyg_restricted$target_event)
+  ),
+  GARCH_q = iyg_selected_orders[, 1],
+  ARCH_p = iyg_selected_orders[, 2],
+  Asymmetry_o = iyg_selected_orders[, 3]
+)
+
+knitr::kable(
+  iyg_order_table,
+  row.names = FALSE,
+  col.names = c(
+    "Model",
+    "GARCH order (q)",
+    "ARCH order (p)",
+    "Asymmetry order (o)"
+  ),
+  caption = paste(
+    "Orders selected automatically by BIC for the",
+    "donor and target variance models."
+  )
+)
+```
+
+An asymmetry order of one means that the selected model includes a
+GJR-type asymmetric term, allowing positive and negative return shocks to have
+different effects on conditional variance. A GARCH order of zero means that
+the specification does not include a lagged conditional-variance term, although
+it may still depend on lagged squared returns through its ARCH component.
+Because BIC selection is performed separately for each donor and the target,
+the selected orders need not be identical across series.
+
+## Inspect donor weights and variance adjustments
+
+The donor balancing weights are stored in `linear_combinations`, while the
+estimated donor-specific adjustments in the conditional variance equation are
+stored in `meta$omega_vec`.
+
+```{r inspect-iyg-donor-adjustments}
+iyg_donor_summary <- data.frame(
+  Donor = as.character(iyg_restricted$donor_events),
+  Weight = as.numeric(
+    iyg_fit$linear_combinations
+  ),
+  Estimated_adjustment = as.numeric(
+    iyg_fit$meta$omega_vec
+  )
+)
+
+knitr::kable(
+  iyg_donor_summary,
+  row.names = FALSE,
+  digits = 6,
+  col.names = c(
+    "Donor episode",
+    "DBW weight",
+    "Estimated variance adjustment"
+  ),
+  caption = paste(
+    "Donor weights and estimated variance adjustments",
+    "for the restricted IYG specification."
+  )
+)
+```
+
+In this example, Brexit and Brexit Poll Released receive the largest DBW
+weights, while the 2012 Election receives a smaller but still positive weight.
+All three estimated variance adjustments are positive, so each donor
+contributes to raising the target's baseline variance forecast.
+
+The weighted donor adjustment is stored in `meta$combined_omega`.
+
+```{r inspect-iyg-combined-adjustment}
+iyg_adjustment_table <- data.frame(
+  Unadjusted_forecast = as.numeric(
+    iyg_fit$predictions$unadjusted[1]
+  ),
+  Combined_adjustment = as.numeric(
+    iyg_fit$meta$combined_omega
+  ),
+  Adjusted_forecast = as.numeric(
+    iyg_fit$predictions$adjusted[1]
+  )
+)
+
+knitr::kable(
+  iyg_adjustment_table,
+  row.names = FALSE,
+  digits = 6,
+  col.names = c(
+    "Unadjusted variance forecast",
+    "Combined donor adjustment",
+    "DBW-adjusted variance forecast"
+  ),
+  caption = "Construction of the DBW-adjusted IYG variance forecast."
+)
+```
+
+The sign of the combined donor adjustment determines the direction in which
+the baseline variance forecast is changed. In this example, the combined
+adjustment is positive, so it raises the unadjusted variance forecast.
+
+`SynthVolForecast()` enforces a positive adjusted variance forecast. This
+constraint is not binding in the present example because the combined
+adjustment is positive.
+
+### Compare the variance forecasts
+
+Because the latent conditional variance is not directly observed, we use the
+squared target return at the first post-shock observation as a realized-variance
+proxy.
+
+```{r compare-iyg-variance-forecasts}
+iyg_proxy_index <-
+  iyg_restricted$shock_time_vec[1] + 1L
+
+iyg_observed_proxy <- as.numeric(
+  iyg_restricted$Y_series_list[[1]][iyg_proxy_index]
+)^2
+
+iyg_forecast_values <- c(
+  as.numeric(
+    iyg_fit$predictions$unadjusted[1]
+  ),
+  as.numeric(
+    iyg_fit$predictions$arithmetic_mean[1]
+  ),
+  as.numeric(
+    iyg_fit$predictions$adjusted[1]
+  )
+)
+
+iyg_forecast_table <- data.frame(
+  Method = c(
+    "Observed squared-return proxy",
+    "Unadjusted",
+    "Arithmetic mean",
+    "DBW adjusted"
+  ),
+  Variance = c(
+    iyg_observed_proxy,
+    iyg_forecast_values
+  ),
+  Absolute_error = c(
+    NA_real_,
+    abs(
+      iyg_forecast_values -
+        iyg_observed_proxy
+    )
+  )
+)
+
+knitr::kable(
+  iyg_forecast_table,
+  row.names = FALSE,
+  digits = 6,
+  col.names = c(
+    "Method",
+    "Variance",
+    "Absolute error"
+  ),
+  caption = paste(
+    "One-step variance forecast comparison for IYG",
+    "under the restricted donor-pool specification."
+  )
+)
+```
+
+As shown in the table, the unadjusted variance forecast substantially
+underestimates the observed squared-return proxy. Both donor-based adjustments
+reduce the absolute error, and the DBW-adjusted forecast is the closest of the
+three forecasts to the observed proxy in this retrospective example.
+
+This result illustrates the workflow but does not imply that DBW weighting
+will outperform alternative forecasts in every application.
+
+# Interpretation and practical guidance
+
+The examples above illustrate a common workflow for post-shock mean and
+conditional variance forecasting. In practice, the quality of the resulting
+forecast depends on the definition of the target episode, the choice of donor
+episodes, and the pre-shock information used for donor balancing.
+
+Several practical points should be considered when using **postshock**.
+
+## Align episodes consistently
+
+The target and donor series should be aligned relative to their own shock
+times. The entry in `shock_time_vec` identifies the final pre-shock
+observation, and the shock effect begins at the following observation.
+
+The ordering of the series, covariate matrices, shock times, and shock lengths
+must remain consistent. For MultiPool analyses, donor names must also match the
+names used in the `pools` specification.
+
+## Separate donor matching from model regressors
+
+The arguments `dbw_indices` and `covariate_indices` have different roles.
+
+- `dbw_indices` selects the pre-shock covariates used to construct donor
+  balancing weights.
+- `covariate_indices` selects covariates included directly as regressors in the
+  donor forecasting models.
+
+Covariates may therefore be used for donor matching without being included in
+the ARIMA, ARIMAX, or GARCH-X equations. This distinction should be made
+explicit when defining an analysis.
+
+## Choose donors using substantive information
+
+Donor episodes should be selected using information available independently of
+the realized target outcome. Economic interpretation, event type, market
+environment, and pre-shock comparability may all be relevant.
+
+The MultiPool extension can be useful when donors represent distinct
+mechanisms. However, the pool definitions and aggregation rule are modeling
+choices. In particular, `pool_agg = "sum"` assumes that the pool-specific
+adjustments can be treated as additive components.
+
+## Inspect weights and convergence
+
+Large DBW weights indicate donors that contribute more strongly to the
+synthetic adjustment under the selected pre-shock features and constraints.
+They should not be interpreted as probabilities that historical events will
+recur.
+
+Users should also inspect the DBW convergence information and consider whether
+the resulting weights are concentrated on only a small number of donors.
+Alternative feature sets, scaling choices, penalties, or pool definitions may
+produce different weights.
+
+## Interpret empirical variance forecasts carefully
+
+`SynthVolForecast()` returns forecasts on the conditional variance scale.
+Taking the square root converts a variance forecast to the corresponding
+standard-deviation scale.
+
+In empirical applications, the latent conditional variance is not directly
+observed. A squared return can be used as a realized-variance proxy, but it is
+itself noisy. Forecast comparisons based on a single squared return should
+therefore be interpreted cautiously.
+
+When `garch_order = NULL`, the GARCH-X specification is selected automatically
+for each donor and the target. Users who need additional diagnostic information
+can set `return_fits = TRUE` and inspect the fitted model objects.
+
+## Avoid post-shock information leakage
+
+Donor weights and the target baseline model should be estimated without using
+the target's post-shock observations. Historical donor post-shock outcomes are
+used by design to estimate donor-specific shock effects.
+
+Realized post-shock target values may be used afterward for retrospective
+evaluation, but they should not influence donor selection, tuning choices, or
+model specification. Thus, the no-leakage restriction concerns information
+from the target's post-shock period, not the already observed post-shock
+histories of the donor episodes.
+
+See the help pages for `dbw()`, `SynthPrediction()`, and
+`SynthVolForecast()` for complete argument and return-value documentation.
+
+# Full Technical Report
+
+The installed package also includes a longer Technical Report with method
+details, simulations, and the COP, IYG, and Apple applications. It is distributed
+as a prebuilt PDF, so opening it does not rerun the examples or require LaTeX:
+
+```{r technical-report-location, eval=FALSE}
+report <- system.file("technical_report", "Technical_report.pdf",
+                      package = "postshock", mustWork = TRUE)
+utils::browseURL(report)
+```
+
+See `help("technical_report", package = "postshock")` for the bundled sources
+and the distinction between the full report and this workflow vignette.
+
+# References
+
+Lin, J., and Eck, D. J. (2021). Minimizing post-shock forecasting error
+through aggregation of outside information. *International Journal of
+Forecasting*, 37(4), 1710–1727.
+<https://doi.org/10.1016/j.ijforecast.2021.03.010>

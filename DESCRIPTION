@@ -1,18 +1,34 @@
 Package: postshock
 Type: Package
-Title: Post-Shock Forecasting with an Intercept Correction Modeling Framework
-Version: 0.2.0
+Title: Donor-Adjusted Post-Shock Forecasting
+Version: 0.2.3
 Authors@R:
     c(
-      person("Qiyang", "Wang", email = "qiyangw3@illinois.edu", role = c("aut","cre")),
-      person("Daniel J.", "Eck", email = "dje13@illinois.edu", role = "aut")
+      person(
+        "Qiyang", "Wang",
+        email = "wangqiyang497@gmail.com",
+        role = c("aut", "cre"),
+        comment = c(ORCID = "0009-0002-6373-440X")
+      ),
+      person(
+        "Daniel J.", "Eck",
+        email = "dje13@illinois.edu",
+        role = "aut"
+      )
     )
-Description: Implements donor balancing weights (DBW) and related utilities
-    for post-shock time-series forecasting. The methods estimate a post-shock
-    intercept-correction term using information aggregated from donor series.
+Description: Implements donor-adjusted methods for forecasting conditional
+    means and variances after structural shocks. Historical donor episodes
+    are weighted using covariates observed before each shock, and their
+    estimated post-shock effects are combined with forecasts from a
+    target-series model. The methods build on Lin and Eck (2021)
+    <doi:10.1016/j.ijforecast.2021.03.010>. The package supports donor
+    balancing weights, structured donor pools, autoregressive integrated
+    moving average models, and generalized autoregressive conditional
+    heteroscedasticity models with external regressors.
 License: MIT + file LICENSE
 Encoding: UTF-8
-Depends: R (>= 3.5.0)
+Language: en-US
+Depends: R (>= 4.1.0)
 Imports:
     Rsolnp,
     garchx,
@@ -21,8 +37,11 @@ Imports:
     xts,
     zoo
 Suggests:
+    knitr,
+    rmarkdown,
     testthat (>= 3.0.0)
 Config/testthat/edition: 3
 Roxygen: list(markdown = TRUE)
-RoxygenNote: 7.3.3
 LazyData: true
+VignetteBuilder: knitr
+Config/roxygen2/version: 8.0.0

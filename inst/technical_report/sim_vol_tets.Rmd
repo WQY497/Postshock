@@ -14,6 +14,9 @@ urlcolor: blue
 ```{r, message=FALSE, warning=FALSE,echo=FALSE}
 # --- Dependencies -------------------------------------------------------------
 library(postshock)
+source(system.file("replication", "check_runtime.R", package = "postshock",
+                   mustWork = TRUE), local = TRUE)
+check_postshock_runtime()
 
 # --- 1) Simulate an sGARCH(1,1) series --------------------------------------
 # We generate y_t = sigma_t * eps_t, with
@@ -210,8 +213,7 @@ res_k <- SynthVolForecast(
   shock_length_vec       = c(shock_length),
   k                      = k,
   covariate_indices      = NULL,     #  GARCH
-  max.p = 3, max.q = 3,
-  plots = FALSE
+  max.p = 3, max.q = 3
 )
 
 pred_k <- res_k$predictions$unadjusted
@@ -237,7 +239,6 @@ legend("topleft", c("true","pred"), col=c("black","red"), lty=c(1,2), lwd=2, bty
 
 ```{r, message=FALSE, warning=FALSE,echo=FALSE}
 # ====== Dependencies ======
-library(garchx)
 library(zoo)
 
 # ====== 1) Simulation: GJR-GARCH(1,1) with an ω-jump ======
@@ -347,8 +348,7 @@ run_once <- function(k) {
     k                      = k,
     dbw_indices            = 1:ncol(target_covariates),  # columns used by DBW
     covariate_indices      = NULL,                       # ⭐ keep GARCH free of xreg
-    max.p = 3, max.q = 3,
-    plots = FALSE
+    max.p = 3, max.q = 3
   )
 
   # — Compare adjusted prediction vs true variance over k steps after t0 —

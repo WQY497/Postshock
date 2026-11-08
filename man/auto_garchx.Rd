@@ -36,9 +36,9 @@ values are not allowed.}
 \item{xreg}{Optional matrix or data frame of exogenous regressors. If
 provided, it must have the same number of rows as \code{length(y)}.}
 
-\item{max.p}{Nonnegative integer. Maximum GARCH lag order to search.}
+\item{max.p}{Nonnegative integer. Maximum ARCH lag order to search.}
 
-\item{max.q}{Nonnegative integer. Maximum ARCH lag order to search.}
+\item{max.q}{Nonnegative integer. Maximum GARCH lag order to search.}
 
 \item{search_o}{Integer vector specifying asymmetry orders to search.
 Supported values are \code{0} and \code{1}, where \code{0} denotes a
@@ -76,9 +76,16 @@ to a reasonable range relative to the sample variance.
 }
 \details{
 The \code{garchx} package uses order \code{c(q, p, o)}, where \code{q} is the
-ARCH order, \code{p} is the GARCH order, and \code{o} is the asymmetry order.
+GARCH order, \code{p} is the ARCH order, and \code{o} is the asymmetry order.
 The trivial specification \code{c(0, 0, 0)} is skipped. Among all converged
 models, the function selects the specification with the lowest BIC.
+A candidate is eligible only if its top-level \code{convergence} is a
+finite numeric scalar equal to zero, its coefficient vector is nonempty
+and finite, and its BIC is a finite scalar. Missing or unknown convergence
+flags are rejected. Standard errors need not all be finite. Exact BIC ties
+retain the first eligible model in the original grid order. If no candidate
+qualifies, an error reports counts of fit, convergence, coefficient and BIC
+rejections. This uses the numerical \code{garchx} status, not DBW's string status.
 
 When \code{final_refit = TRUE}, the selected model is refit using a scalar
 \code{backcast.values} initialized from the estimated unconditional variance.
@@ -88,6 +95,10 @@ For a GJR specification, the unconditional variance is approximated as
 }
 If this value is invalid or outside the clamped range, the sample variance is
 used instead.
+The original backcast skip conditions retain the eligible grid winner.
+A refit uses the same eligibility checks and replaces the grid fit only
+for strictly lower BIC; errors, invalid status/parameters/BIC, and ties
+retain the original grid object.
 }
 \examples{
 \donttest{

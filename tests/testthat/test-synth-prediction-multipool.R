@@ -96,8 +96,7 @@ run_multipool_toy <- function(
     base_use_dbw = base_use_dbw,
     pool_use_dbw = pool_use_dbw,
     arima_order = c(1L, 0L, 0L),
-    seasonal = FALSE,
-    plots = FALSE
+    seasonal = FALSE
   )
 }
 

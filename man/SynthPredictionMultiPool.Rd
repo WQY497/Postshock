@@ -26,7 +26,7 @@ target; \code{[[2]]}..\code{[[n+1]]} are donors.}
 Used for DBW features and (optionally) as \code{xreg} in ARIMA. You may pass
 \code{Y_series_list} here as a simple baseline.}
 
-\item{shock_time_vec}{Vector of shock start times, each either a time index present
+\item{shock_time_vec}{Vector of last pre-shock boundaries, each either a time index present
 in the corresponding series or a positive integer row number. Length must equal
 \code{length(Y_series_list)}.}
 
@@ -45,6 +45,13 @@ names (matching \code{names(Y_series_list)}). Pool names define channels.}
 \item{base_use_dbw}{Logical. Whether DBW is used in the baseline forecast.}
 
 \item{pool_use_dbw}{Logical. Whether DBW is used within each pool.}
+
+\item{...}{Common matching, ARIMA, seasonal, penalty and target-control
+arguments forwarded unchanged to the underlying
+\code{\link{SynthPrediction}} calls.
+Duplicate named settings and \code{use_dbw} in \code{...} are errors:
+use \code{base_use_dbw} and \code{pool_use_dbw} for the two paths.
+\code{geometric_sets} remains reserved; there are no pool-specific overrides.}
 }
 \value{
 Same structure as \code{SynthPrediction()}, with extra:

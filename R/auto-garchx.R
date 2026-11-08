@@ -9,8 +9,8 @@
 #'   values are not allowed.
 #' @param xreg Optional matrix or data frame of exogenous regressors. If
 #'   provided, it must have the same number of rows as \code{length(y)}.
-#' @param max.p Nonnegative integer. Maximum GARCH lag order to search.
-#' @param max.q Nonnegative integer. Maximum ARCH lag order to search.
+#' @param max.p Nonnegative integer. Maximum ARCH lag order to search.
+#' @param max.q Nonnegative integer. Maximum GARCH lag order to search.
 #' @param search_o Integer vector specifying asymmetry orders to search.
 #'   Supported values are \code{0} and \code{1}, where \code{0} denotes a
 #'   symmetric GARCH model and \code{1} denotes a GJR-type asymmetric model.
@@ -27,9 +27,16 @@
 #'
 #' @details
 #' The \code{garchx} package uses order \code{c(q, p, o)}, where \code{q} is the
-#' ARCH order, \code{p} is the GARCH order, and \code{o} is the asymmetry order.
+#' GARCH order, \code{p} is the ARCH order, and \code{o} is the asymmetry order.
 #' The trivial specification \code{c(0, 0, 0)} is skipped. Among all converged
 #' models, the function selects the specification with the lowest BIC.
+#' A candidate is eligible only if its top-level \code{convergence} is a
+#' finite numeric scalar equal to zero, its coefficient vector is nonempty
+#' and finite, and its BIC is a finite scalar. Missing or unknown convergence
+#' flags are rejected. Standard errors need not all be finite. Exact BIC ties
+#' retain the first eligible model in the original grid order. If no candidate
+#' qualifies, an error reports counts of fit, convergence, coefficient and BIC
+#' rejections. This uses the numerical \code{garchx} status, not DBW's string status.
 #'
 #' When \code{final_refit = TRUE}, the selected model is refit using a scalar
 #' \code{backcast.values} initialized from the estimated unconditional variance.
@@ -39,6 +46,10 @@
 #' }
 #' If this value is invalid or outside the clamped range, the sample variance is
 #' used instead.
+#' The original backcast skip conditions retain the eligible grid winner.
+#' A refit uses the same eligibility checks and replaces the grid fit only
+#' for strictly lower BIC; errors, invalid status/parameters/BIC, and ties
+#' retain the original grid object.
 #'
 #' @return A list containing:
 #' \itemize{
@@ -82,6 +93,26 @@ auto_garchx <- function(
     verbose      = TRUE
 ) {
   vcov.type <- match.arg(vcov.type)
+  qualify_fit <- function(fit, sample_size) {
+    if (inherits(fit, "try-error") || !is.list(fit)) return(list(reason = "fit error"))
+    status <- fit$convergence
+    if (!is.numeric(status) || is.complex(status) || !is.null(dim(status)) ||
+        length(status) != 1L || !is.finite(status) || status != 0) {
+      return(list(reason = "convergence"))
+    }
+    coefficients <- tryCatch(coef(fit), error = function(condition) NULL)
+    if (!is.numeric(coefficients) || is.complex(coefficients) ||
+        !is.null(dim(coefficients)) || !length(coefficients) || any(!is.finite(coefficients))) {
+      return(list(reason = "coefficients"))
+    }
+    likelihood <- tryCatch(logLik(fit), error = function(condition) NULL)
+    if (!is.numeric(likelihood) || is.complex(likelihood) ||
+        length(likelihood) != 1L || !is.finite(likelihood)) return(list(reason = "BIC"))
+    parameter_count <- length(coefficients)
+    bic <- -2 * as.numeric(likelihood) + parameter_count * log(sample_size)
+    if (!is.finite(bic)) return(list(reason = "BIC"))
+    list(reason = NULL, bic = bic, aic = -2 * as.numeric(likelihood) + 2 * parameter_count)
+  }
   
   # ---- Basic input checks ----------------------------------------------------
   if (!is.numeric(y) || !is.vector(y)) {
@@ -139,6 +170,7 @@ auto_garchx <- function(
   )
   
   # ---- 1) Grid search over (q, p, o) -----------------------------------------
+  rejected <- c("fit error" = 0L, "convergence" = 0L, "coefficients" = 0L, "BIC" = 0L)
   # garchx::garchx(order = c(q, p, o))
   for (q in 0:max.q) {
     for (p in 0:max.p) {
@@ -159,15 +191,13 @@ auto_garchx <- function(
           silent = TRUE
         )
         
-        if (inherits(fit0, "try-error")) {
+        qualification <- qualify_fit(fit0, n)
+        if (!is.null(qualification$reason)) {
+          rejected[qualification$reason] <- rejected[qualification$reason] + 1L
           next
         }
-        
-        ll <- as.numeric(logLik(fit0))
-        k  <- length(coef(fit0))
-        
-        bic0 <- -2 * ll + k * log(n)
-        aic0 <- -2 * ll + 2 * k
+        bic0 <- qualification$bic
+        aic0 <- qualification$aic
         
         if (is.finite(bic0) && bic0 < best$bic) {
           best <- list(
@@ -185,7 +215,8 @@ auto_garchx <- function(
   }
   
   if (is.null(best$fit)) {
-    stop("auto_garchx: no converged model in grid search.")
+    stop("auto_garchx: no converged model in grid search; rejected candidates: ",
+         paste(names(rejected), rejected, sep = "=", collapse = ", "), ".")
   }
   
   # If no final refit is requested, return the grid-search winner
@@ -253,18 +284,17 @@ auto_garchx <- function(
     silent = TRUE
   )
   
-  if (inherits(fit2, "try-error")) {
+  qualification <- qualify_fit(fit2, n)
+  if (!is.null(qualification$reason)) {
     if (isTRUE(verbose)) {
-      warning("[auto_garchx] backcast refit failed; keeping grid-search model.")
+      warning("[auto_garchx] backcast refit rejected (", qualification$reason,
+              "); keeping grid-search model.")
     }
     return(best)
   }
   
-  ll2 <- as.numeric(logLik(fit2))
-  k2  <- length(coef(fit2))
-  
-  bic2 <- -2 * ll2 + k2 * log(n)
-  aic2 <- -2 * ll2 + 2 * k2
+  bic2 <- qualification$bic
+  aic2 <- qualification$aic
   
   if (is.finite(bic2) && bic2 < best$bic) {
     best$fit        <- fit2

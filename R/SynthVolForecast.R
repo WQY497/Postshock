@@ -33,16 +33,15 @@
 #' @param penalty_lambda Numeric penalty weight forwarded to \code{\link{dbw}}.
 #' @param penalty_normchoice Character string, either \code{"l1"} or
 #'   \code{"l2"}, forwarded to \code{\link{dbw}}.
-#' @param plots Logical. If \code{TRUE} and a function named
-#'   \code{plot_maker_garch} exists, it is called to visualize the result.
-#' @param shock_time_labels Optional labels passed to the plotting helper.
 #' @param return_fits Logical. If \code{TRUE}, the fitted donor and target
 #'   GARCH objects are returned.
-#' @param garch_order Optional fixed GARCH-X order \code{c(q, p, o)}. If
-#'   \code{NULL}, the order is selected by \code{\link{auto_garchx}}.
-#' @param max.p Nonnegative integer. Maximum GARCH lag order passed to
+#' @param garch_order Optional fixed GARCH-X order \code{c(q, p, o)}, where
+#'   \code{q} is the GARCH order, \code{p} is the ARCH order, and \code{o}
+#'   is the asymmetry order. If \code{NULL}, the order is selected by
 #'   \code{\link{auto_garchx}}.
-#' @param max.q Nonnegative integer. Maximum ARCH lag order passed to
+#' @param max.p Nonnegative integer. Maximum ARCH lag order passed to
+#'   \code{\link{auto_garchx}}.
+#' @param max.q Nonnegative integer. Maximum GARCH lag order passed to
 #'   \code{\link{auto_garchx}}.
 #' @param backcast.initial Optional positive numeric scalar used as
 #'   \code{backcast.values} when \code{garch_order} is fixed.
@@ -104,14 +103,13 @@
 #'   shock_length_vec = c(10L, 10L, 10L),
 #'   k = 2,
 #'   covariate_indices = 1:2,
-#'   dbw_indices = 1:2,
-#'   plots = FALSE
+#'   dbw_indices = 1:2
 #' )
 #'
 #' str(out$predictions)
 #' }
 #'
-#' @importFrom stats coef complete.cases fitted predict vcov
+#' @importFrom stats coef complete.cases predict vcov
 #' @importFrom lmtest coeftest
 #' @importFrom garchx garchx
 #' @export
@@ -129,8 +127,6 @@ SynthVolForecast <- function(
     covariate_indices = NULL,
     penalty_lambda = 0,
     penalty_normchoice = "l1",
-    plots = TRUE,
-    shock_time_labels = NULL,
     return_fits = FALSE,
     garch_order = NULL,
     max.p = 3,
@@ -461,28 +457,6 @@ SynthVolForecast <- function(
     out$target_fit <- fit_target
   }
   
-  # ---- optional plot hook ----------------------------------------------------
-  if (isTRUE(plots)) {
-    f <- get0("plot_maker_garch", mode = "function", inherits = TRUE)
-    
-    if (!is.null(f)) {
-      try(
-        f(
-          fitted(fit_target),
-          shock_time_labels,
-          shock_time_vec,
-          shock_length_vec,
-          raw_vec,
-          w_hat,
-          omega_star_hat_vec,
-          omega_star_std_err_vec,
-          adjusted_vec,
-          arithmetic_vec
-        ),
-        silent = TRUE
-      )
-    }
-  }
-  
+ 
   out
 }

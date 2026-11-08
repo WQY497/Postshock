@@ -86,8 +86,7 @@ test_that("SynthPrediction returns valid k-step forecasts", {
     k = 3L,
     use_dbw = FALSE,
     arima_order = c(1L, 0L, 0L),
-    seasonal = FALSE,
-    plots = FALSE
+    seasonal = FALSE
   )
   
   # Check the top-level output structure
@@ -131,8 +130,7 @@ test_that("SynthPrediction uses equal weights when DBW is disabled", {
     k = 2L,
     use_dbw = FALSE,
     arima_order = c(1L, 0L, 0L),
-    seasonal = FALSE,
-    plots = FALSE
+    seasonal = FALSE
   )
   
   # Two donors should receive equal weights
@@ -184,8 +182,7 @@ test_that("SynthPrediction returns feasible DBW weights", {
     penalty_normchoice = "l2",
     penalty_lambda = 1e-2,
     arima_order = c(1L, 0L, 0L),
-    seasonal = FALSE,
-    plots = FALSE
+    seasonal = FALSE
   )
   
   # Check the donor weight vector
@@ -254,8 +251,7 @@ test_that("SynthPrediction maps Date shock times to the correct rows", {
     k = 2L,
     use_dbw = FALSE,
     arima_order = c(1L, 0L, 0L),
-    seasonal = FALSE,
-    plots = FALSE
+    seasonal = FALSE
   )
   
   # Same shock, now specified using the Date label at row 70
@@ -267,8 +263,7 @@ test_that("SynthPrediction maps Date shock times to the correct rows", {
     k = 2L,
     use_dbw = FALSE,
     arima_order = c(1L, 0L, 0L),
-    seasonal = FALSE,
-    plots = FALSE
+    seasonal = FALSE
   )
   
   # Date row 70 and integer row 70 must produce the same result

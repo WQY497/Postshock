@@ -41,8 +41,10 @@ is truncated to rows \code{1:shock_i} before matching.}
 \item{bounded_below_by, bounded_above_by}{Numeric scalars; lower/upper bounds
 for each weight (broadcast to all weights).}
 
-\item{princ_comp_count}{\code{NULL} or positive integer; if not \code{NULL},
-apply PCA and keep that many principal components.}
+\item{princ_comp_count}{\code{NULL} or a single finite positive integer.
+If not \code{NULL}, apply PCA and retain that many right-singular-vector
+directions from the processed matching matrix. Invalid or unavailable
+dimensions cause an error; requests are not rounded or truncated.}
 
 \item{normchoice}{Character; \code{"l1"} or \code{"l2"} distance.}
 
@@ -60,9 +62,10 @@ for Y (e.g., \code{c(1,2,5)} means last, 2nd last, 5th last).}
 for X. If \code{NULL}, use only the last pre-shock row.}
 
 \item{inputted_transformation}{Function applied to each \code{Y[[i]]} before
-merging; defaults to \code{base::identity}.
-#' @param verbose Logical. If \code{TRUE}, print optimization iteration
-information from \code{Rsolnp::solnp()}. Defaults to \code{FALSE}.}
+merging; defaults to \code{base::identity}.}
+
+\item{verbose}{Logical. If \code{TRUE}, print optimization progress
+and diagnostic information.}
 }
 \value{
 A list with:
@@ -81,6 +84,22 @@ box constraints, and L1/L2 regularization on weights.
 With \code{sum_to_1=TRUE} and nonnegative bounds, \eqn{||W||_1 = 1}; L1
 regularization on \eqn{||W||_1} is then a constant and does not change the
 optimum. Use L2 if you want an effective penalty under simplex constraints.
+
+PCA is applied after feature selection, pre-shock truncation, lookback
+expansion, stacking the target and donors, removal of constant columns,
+and the existing \code{center}/\code{scale} operations. The available direction
+count is \code{min(nrow(dat), ncol(dat))} for the processed matching matrix
+\code{dat}, as supplied by the default \code{svd(dat)}. This is a dimension bound,
+not a numerical-rank threshold: zero singular values are not filtered and
+no automatic component selection is performed. The existing restriction
+against PCA with only one remaining feature is retained. \code{NULL} leaves
+the unprojected matching path unchanged; PCA does not force centering.
+
+Donor weights are optimized in the common PC score space, not taken from
+explained-variance proportions. The return structure and optimizer-status
+reporting are unchanged, including \code{"failed_convergence"} when reported
+by the solver. Explicit PCA prediction calls to \code{SynthPrediction()}
+additionally reject unsuccessful status or unusable weights.
 }
 \examples{
 \donttest{

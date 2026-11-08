@@ -1,4 +1,4 @@
-#' SynthPrediction — Synthetic Prediction with Donor Balancing & Shock Adjustment
+#' SynthPrediction - Synthetic Prediction with Donor Balancing and Shock Adjustment
 #'
 #' @description
 #' Build k-step-ahead forecasts for a **target** time series by:
@@ -8,15 +8,15 @@
 #' by the weighted donor effect. Indices across lists are assumed aligned.
 #'
 #' **Seasonality:** \code{seasonal=TRUE} by default. For *each* series, seasonality
-#' is enabled only if \code{forecast::findfrequency()} detects a frequency > 1
-#' (NA or <= 1 disables seasonality for that series).
+#' uses an explicit period or \code{forecast::findfrequency()} on that series'
+#' fitting window. Periods above one enable seasonal search; otherwise it is off.
 #'
 #' @param Y_series_list List of time series (e.g., \code{xts}). \code{[[1]]} is the
 #' target; \code{[[2]]}..\code{[[n+1]]} are donors.
 #' @param covariates_series_list List of time series aligned with \code{Y_series_list}.
 #' Used for DBW features and (optionally) as \code{xreg} in ARIMA. You may pass
 #' \code{Y_series_list} here as a simple baseline.
-#' @param shock_time_vec Vector of shock start times, each either a time index present
+#' @param shock_time_vec Vector of last pre-shock boundaries, each either a time index present
 #' in the corresponding series or a positive integer row number. Length must equal
 #' \code{length(Y_series_list)}.
 #' @param shock_length_vec Integer vector (same length) giving the post-shock window
@@ -26,43 +26,96 @@
 #' @param dbw_indices Integer vector of covariate columns used by \code{dbw}.
 #' If \code{NULL}, informative columns are auto-selected at pre-shock rows.
 #' @param use_dbw Logical; if \code{FALSE}, use equal donor weights; otherwise use \code{dbw}.
-#' @param princ_comp_input Optional PCA dimension for \code{dbw} (forwarded only).
+#' @param princ_comp_input \code{NULL} or a single finite positive integer,
+#' forwarded as \code{dbw(princ_comp_count = princ_comp_input)} when DBW is
+#' enabled. Invalid or unavailable dimensions cause an error. The direction
+#' limit follows the processed matching matrix described in \code{\link{dbw}}.
+#' Single-pool \code{use_dbw=FALSE} ignores this unused setting.
 #' @param covariate_indices Integer vector of columns from
 #' \code{covariates_series_list[[i]]} to include as \code{xreg} in ARIMA
 #' (lagged for the target; contemporaneous for donors). If \code{NULL}, donors use only
-#' the post-shock indicator and the target uses no \code{xreg}.
-#' @param geometric_sets,days_before_shocktime_vec Reserved (ignored).
+#' the post-shock indicator and the target uses only any supplied controls.
+#' With extra donor covariates, selected X and Y must be finite, complete and
+#' row-aligned throughout the original donor fitting window. Invalid rows,
+#' columns or indexed dates cause an error before fitting or fallback.
+#' @param geometric_sets Reserved and ignored; retained for compatibility.
+#' @param days_before_shocktime_vec Single lookback length for DBW, not a
+#' per-series vector. \code{NULL} uses the last pre-shock row; a positive length
+#' uses that many observations backwards from each boundary.
 #' @param arima_order Optional fixed ARIMA order \code{c(p,d,q)} for all series;
 #' if \code{NULL}, \code{forecast::auto.arima()} is used.
 #' @param seasonal Logical: whether seasonal models are allowed/requested. Default \code{TRUE}.
 #' @param seasonal_order Optional seasonal order \code{c(P,D,Q)} used only when
-#' \code{arima_order} is supplied and seasonal detection is \code{TRUE}.
-#' @param seasonal_period Optional seasonal period. If \code{NULL} and \code{seasonal=TRUE},
-#' it is auto-detected per series via \code{findfrequency()}.
+#' \code{arima_order} is supplied and the chosen period exceeds one. Ignored
+#' during automatic order selection.
+#' @param seasonal_period Optional single finite positive integer in observation
+#' steps, not calendar units. With \code{seasonal=TRUE}, an explicit period is
+#' used or \code{NULL} detects it per fitting window via \code{findfrequency()}.
+#' Period one disables seasonal search. The parameter is ignored when
+#' \code{seasonal=FALSE}; user periods are not rounded.
 #' @param user_ic_choice Information criterion for \code{auto.arima}
 #' (\code{"aicc"}, \code{"aic"}, \code{"bic"}).
 #' @param stepwise,approximation Passed through to \code{forecast::auto.arima()}.
-#' @param plots Logical; if \code{TRUE} and a function named
-#' \code{plot_maker_synthprediction} exists, it is called to visualize results.
-#' @param display_ground_truth_choice Logical; forwarded to the plotting helper if it exists.
 #' @param penalty_lambda Numeric L1/L2 penalty forwarded to \code{dbw}.
 #' @param penalty_normchoice Character \code{"l1"} or \code{"l2"}; forwarded to \code{dbw}.
-#' @param control_shocks Optional list of shock specifications to control for (remove) in the
-#' target series model. Typically \code{list(list(time=..., length=..., shape=...))}.
+#' @param control_shocks Optional series-level list; only its first element is
+#' used for historical target controls. For one point control, use
+#' \code{list(list(list(time=3, length=1, shape="point")))}. The first element
+#' can also be a specification or data frame accepted by \code{build_control_xreg}.
+#' Future control values are zero; donors do not receive these controls.
 #' @param pools Optional named list of donor pools. If provided, the call is
 #' dispatched to \code{SynthPredictionMultiPool()}.
+#' The PCA setting \code{princ_comp_input} is forwarded; each internal call
+#' uses PCA only when its existing \code{base_use_dbw} or \code{pool_use_dbw}
+#' switch enables DBW. If both switches are false, PCA is not evaluated.
+#' Common matching, ARIMA, seasonal, penalty and control settings are forwarded
+#' unchanged. Single-pool \code{use_dbw} does not override the MultiPool switches.
 #' @param pool_agg Aggregation rule across pools ("sum" or "weighted").
 #' @param pool_weights Optional named numeric vector of pool weights.
 #' @param base_use_dbw Logical. Whether DBW is used in the baseline forecast.
 #' @param pool_use_dbw Logical. Whether DBW is used within each pool.
+#' @param ... Additional arguments passed to
+#'   \code{\link{SynthPredictionMultiPool}} when \code{pools} is supplied.
 
 
 #'
+#' @details
+#' With an explicit PCA request and DBW enabled, preprocessing, SVD and DBW
+#' errors stop prediction instead of falling back to equal weights. An empty
+#' matching feature set also causes an error. A DBW result must report the
+#' string \code{"convergence"} and supply one finite real numeric weight per
+#' donor. Its weights must satisfy the existing simplex constraints, allowing
+#' absolute tolerances of \code{1e-7} on each bound and \code{1e-6} on the
+#' sum-to-one constraint. Weights are neither clipped nor renormalized.
+#' These tolerances match the existing DBW regression checks and accommodate
+#' numerical residuals from the unchanged solver tolerance of \code{1e-8}.
+#' The DBW weights, not PC explained-variance proportions, aggregate donor
+#' effects. With \code{princ_comp_input=NULL}, the existing warning, fallback
+#' and returned-status behavior is preserved.
+#'
+#' Extra donor ARIMAX regressors are checked on rows 1 through boundary plus
+#' shock length. No rows are omitted or imputed. Errors identify the donor,
+#' affected variable, original row and available date/time; only selected
+#' columns and the fitting window are checked. Indexed Y and X must agree
+#' within a donor; calendars across historical donors need not agree. Unindexed
+#' inputs use positional alignment. Target lagged-regressor handling is unchanged.
+#'
+#' For automatic ARIMA, the selected or detected period is carried by the
+#' univariate response's \code{ts} frequency. Numerical observations, order
+#' and window length are unchanged. Existing input frequency is not a separate
+#' priority: this interface uses its explicit-period or per-window detection
+#' rule. No calendar gaps are filled. The target's forecast-period response
+#' is not used for detection. A donor automatic-fit error retains the original
+#' non-seasonal ARIMA(1,1,1) fallback, with a warning; input validation errors
+#' are not caught by this fallback.
+#'
 #' @return A list with components:
 #' \itemize{
-#'   \item \code{linear_combinations} — numeric donor weights \eqn{W}.
-#'   \item \code{predictions} — list with numeric vectors \code{unadjusted}, \code{adjusted}, \code{arithmetic_mean}.
-#'   \item \code{meta} — metadata (weights, shock timing, ARIMA orders, IC used, etc.).
+#'   \item \code{linear_combinations}: numeric donor weights \eqn{W}.
+#'   \item \code{predictions}: list with numeric vectors \code{unadjusted}, \code{adjusted},
+#'         and \code{arithmetic_mean}.
+#'   \item \code{meta}: metadata including weights, shock timing, ARIMA orders,
+#'         and the information criterion used.
 #' }
 #'
 #' If \code{pools} is provided, the function dispatches to
@@ -90,8 +143,7 @@
 #'    covariates_series_list = X,
 #'    shock_time_vec = shock_time,
 #'    shock_length_vec = shock_len,
-#'    k = 2,
-#'    plots = FALSE
+#'    k = 2
 #' )
 #' str(out$predictions)
 #' }
@@ -122,8 +174,6 @@ SynthPrediction <- function(
     user_ic_choice = c("aicc","aic","bic")[1],
     stepwise = TRUE,
     approximation = TRUE,
-    plots = TRUE,
-    display_ground_truth_choice = FALSE,
     penalty_lambda = 0,
     penalty_normchoice = "l1",
     control_shocks = NULL,
@@ -147,11 +197,41 @@ SynthPrediction <- function(
       pool_weights           = pool_weights,
       base_use_dbw           = base_use_dbw,
       pool_use_dbw           = pool_use_dbw,
+      dbw_scale              = dbw_scale,
+      dbw_center             = dbw_center,
+      dbw_indices            = dbw_indices,
+      princ_comp_input       = princ_comp_input,
+      covariate_indices      = covariate_indices,
+      geometric_sets         = geometric_sets,
+      days_before_shocktime_vec = days_before_shocktime_vec,
+      arima_order            = arima_order,
+      seasonal               = seasonal,
+      seasonal_order         = seasonal_order,
+      seasonal_period        = seasonal_period,
+      user_ic_choice         = user_ic_choice,
+      stepwise               = stepwise,
+      approximation          = approximation,
+      penalty_lambda         = penalty_lambda,
+      penalty_normchoice     = penalty_normchoice,
+      control_shocks         = control_shocks,
       ...
     ))
   }
   
+  if (isTRUE(use_dbw) && !is.null(princ_comp_input) &&
+      (!is.numeric(princ_comp_input) || is.complex(princ_comp_input) ||
+       length(princ_comp_input) != 1L || !is.finite(princ_comp_input) ||
+       princ_comp_input <= 0 || princ_comp_input != floor(princ_comp_input))) {
+    stop("princ_comp_input must be a single finite positive integer.")
+  }
+
   # Ensure an identity transform exists for DBW transforms
+  if (isTRUE(seasonal) && !is.null(seasonal_period) &&
+      (!is.numeric(seasonal_period) || is.complex(seasonal_period) ||
+       length(seasonal_period) != 1L || !is.finite(seasonal_period) ||
+       seasonal_period <= 0 || seasonal_period != floor(seasonal_period))) {
+    stop("seasonal_period must be a single finite positive integer.")
+  }
   if (!exists("id")) id <- function(x) x
   
   n <- as.integer(length(Y_series_list) - 1L)
@@ -237,12 +317,18 @@ SynthPrediction <- function(
   decide_seasonal <- function(y_vec, seasonal_flag, seasonal_period_user = NULL){
     if (!isTRUE(seasonal_flag)) return(list(flag = FALSE, period = NULL))
     if (!is.null(seasonal_period_user)) {
-      return(list(flag = TRUE, period = as.integer(round(seasonal_period_user))))
+      return(list(flag = seasonal_period_user > 1, period = seasonal_period_user))
     }
     freq <- tryCatch(forecast::findfrequency(as.numeric(y_vec)),
                      error = function(e) NA_real_)
-    if (is.na(freq) || freq <= 1) list(flag = FALSE, period = NULL)
+    if (length(freq) != 1L || !is.finite(freq) || freq <= 1) list(flag = FALSE, period = NULL)
     else                          list(flag = TRUE,  period = as.integer(round(freq)))
+  }
+  automatic_response <- function(response, decision) {
+    if (!is.numeric(response) || is.complex(response) || NCOL(response) != 1L) {
+      stop("SynthPrediction: automatic ARIMA requires a real numeric univariate response.")
+    }
+    stats::ts(as.numeric(response), frequency = if (decision$flag) decision$period else 1)
   }
   
   ## ---------- 1) Donor (S)ARIMA with post-shock indicator ----------
@@ -259,15 +345,21 @@ SynthPrediction <- function(
     vec1  <- rep(1, Ls)
     post_shock_indicator <- c(vec0, vec1)    # equals 1 from (preT+1) onward
     
-    # Donor design matrix; match y length to rows of X_i_final if NA removal occurs
+    # Donor design matrix
     if (is.null(covariate_indices)) {
       X_i_final <- post_shock_indicator
       y_fit     <- Y_series_list[[i]][1:last]
     } else {
-      X_i_subset <- covariates_series_list[[i]][1:last, covariate_indices, drop = FALSE]
-      X_i_final  <- cbind(X_i_subset, post_shock_indicator)
-      X_i_final  <- stats::na.omit(X_i_final)
-      y_fit      <- Y_series_list[[i]][1:NROW(X_i_final)]
+      donor_label <- names(Y_series_list)[i]
+      if (is.null(donor_label) || is.na(donor_label) || !nzchar(donor_label)) {
+        donor_label <- paste("donor", i - 1L)
+      }
+      validated <- validate_donor_arimax(
+        Y_series_list[[i]], covariates_series_list[[i]], covariate_indices,
+        last, donor_label
+      )
+      X_i_final <- cbind(validated$covariates, post_shock_indicator)
+      y_fit <- validated$response
     }
     
     # Per-donor seasonal decision
@@ -286,12 +378,15 @@ SynthPrediction <- function(
       }
     } else {
       tryCatch(
-        forecast::auto.arima(y_fit, xreg = X_i_final, ic = user_ic_choice,
+        forecast::auto.arima(automatic_response(y_fit, seas_dec), xreg = X_i_final, ic = user_ic_choice,
                              seasonal = seasonal_flag_i, stepwise = stepwise,
                              approximation = approximation),
         error = function(e){
-          warning(sprintf("Donor %d: auto.arima() failed → fallback to Arima(1,1,1)", i))
-          forecast::Arima(y_fit, order = c(1,1,1), seasonal = FALSE, xreg = X_i_final)
+          warning(sprintf(
+            "Donor %d: auto.arima() failed; falling back to non-seasonal Arima(1,1,1)",
+            i
+          ))
+          forecast::Arima(as.numeric(y_fit), order = c(1,1,1), seasonal = FALSE, xreg = X_i_final)
         }
       )
     }
@@ -318,6 +413,7 @@ SynthPrediction <- function(
   if (!isTRUE(use_dbw)) {
     w_hat <- equal_w
   } else {
+    tryCatch({
     # Prefer covariates for DBW features; fallback to Y
     X_for_dbw <- if (!is.null(covariates_series_list)) covariates_series_list else Y_series_list
     X_for_dbw <- lapply(X_for_dbw, function(obj){
@@ -337,7 +433,10 @@ SynthPrediction <- function(
     }
     
     if (length(dbw_indices) == 0) {
-      warning("[DBW] no informative columns pre-shock → fallback to equal weights.")
+      if (!is.null(princ_comp_input)) {
+        stop("no informative matching features are available.")
+      }
+      warning("[DBW] no informative columns pre-shock; using equal weights.")
       w_hat <- equal_w
     } else {
       dbw_output <- tryCatch(
@@ -346,6 +445,7 @@ SynthPrediction <- function(
           dbw_indices = dbw_indices,
           shock_time_vec = as.integer(integer_shock_time_vec),
           scale = dbw_scale, center = dbw_center,
+          princ_comp_count = princ_comp_input,
           sum_to_1 = TRUE, bounded_below_by = 0, bounded_above_by = 1,
           Y = Y_series_list,
           Y_lookback_indices = NULL,
@@ -355,12 +455,36 @@ SynthPrediction <- function(
           penalty_normchoice = penalty_normchoice
         ),
         error = function(e){
+          if (!is.null(princ_comp_input)) stop(e)
           warning(paste0("[DBW] failed: ", e$message))
           NULL
         }
       )
+      if (!is.null(princ_comp_input)) {
+        if (!is.list(dbw_output) ||
+            !identical(dbw_output$convergence, "convergence")) {
+          stop("DBW must return convergence status 'convergence'.")
+        }
+        pca_weights <- dbw_output$opt_params
+        bound_tolerance <- 1e-7
+        sum_tolerance <- 1e-6
+        if (!is.numeric(pca_weights) || is.complex(pca_weights) ||
+            !is.null(dim(pca_weights)) || length(pca_weights) != n_donors ||
+            any(!is.finite(pca_weights)) ||
+            any(pca_weights < -bound_tolerance | pca_weights > 1 + bound_tolerance) ||
+            abs(sum(pca_weights) - 1) > sum_tolerance) {
+          stop("DBW weights must be a finite numeric vector with one value per donor and satisfy the simplex constraints.")
+        }
+      }
       w_hat <- if (is.null(dbw_output)) equal_w else dbw_output$opt_params
     }
+    }, error = function(condition) {
+      if (!is.null(princ_comp_input)) {
+        stop("SynthPrediction: explicit PCA failed: ", conditionMessage(condition),
+             call. = FALSE)
+      }
+      stop(condition)
+    })
   }
   
   # Weighted donor shock effect
@@ -370,7 +494,8 @@ SynthPrediction <- function(
   pt1 <- integer_shock_time_vec[1]
   stopifnot(pt1 >= 1L)
   
-  target_series     <- Y_series_list[[1]][ 1:pt1 ]  # includes preT → 1-step = preT+1
+  target_series <- Y_series_list[[1]][1:pt1]
+  # Includes preT; the one-step-ahead forecast corresponds to preT + 1.
   forecast_horizon  <- k
   
   # --- Build Control Shocks Dummy Matrix ---
@@ -434,7 +559,7 @@ SynthPrediction <- function(
     }
   } else {
     forecast::auto.arima(
-      target_series, xreg = xreg_input, ic = user_ic_choice,
+      automatic_response(target_series, seas_dec_t), xreg = xreg_input, ic = user_ic_choice,
       seasonal = seasonal_flag_target, stepwise = stepwise, approximation = approximation
     )
   }
@@ -506,22 +631,6 @@ SynthPrediction <- function(
     meta                = meta
   )
   
-  if (isTRUE(plots)) {
-    if(exists("plot_maker_synthprediction")) {
-      plot_maker_synthprediction(
-        Y_series_list,
-        shock_time_vec,
-        integer_shock_time_vec,
-        shock_length_vec,
-        raw_vec,
-        w_hat,
-        omega_star_hat_vec,
-        adjusted_vec,
-        arithmetic_vec,
-        display_ground_truth = display_ground_truth_choice
-      )
-    }
-  }
   
   return(output_list)
 }

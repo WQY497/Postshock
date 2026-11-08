@@ -14,8 +14,10 @@
 #' @param sum_to_1 Logical; if `TRUE`, enforce `sum(W)=1`.
 #' @param bounded_below_by,bounded_above_by Numeric scalars; lower/upper bounds
 #'   for each weight (broadcast to all weights).
-#' @param princ_comp_count `NULL` or positive integer; if not `NULL`,
-#'   apply PCA and keep that many principal components.
+#' @param princ_comp_count `NULL` or a single finite positive integer.
+#'   If not `NULL`, apply PCA and retain that many right-singular-vector
+#'   directions from the processed matching matrix. Invalid or unavailable
+#'   dimensions cause an error; requests are not rounded or truncated.
 #' @param normchoice Character; `"l1"` or `"l2"` distance.
 #' @param penalty_normchoice Character; `"l1"` (LASSO) or `"l2"` (Ridge)
 #'   on weights.
@@ -27,9 +29,11 @@
 #'   for X. If `NULL`, use only the last pre-shock row.
 #' @param inputted_transformation Function applied to each `Y[[i]]` before
 #'   merging; defaults to `base::identity`.
-#'#' @param verbose Logical. If \code{TRUE}, print optimization iteration
+#' @param verbose Logical. If \code{TRUE}, print optimization iteration
 #'   information from \code{Rsolnp::solnp()}. Defaults to \code{FALSE}.
-#'
+#' @param verbose Logical. If \code{TRUE}, print optimization progress
+#'   and diagnostic information.
+#'   
 #' @return A list with:
 #' \itemize{
 #'   \item \code{opt_params}: numeric vector of donor weights (length = #donors)
@@ -41,6 +45,22 @@
 #' With `sum_to_1=TRUE` and nonnegative bounds, \eqn{||W||_1 = 1}; L1
 #' regularization on \eqn{||W||_1} is then a constant and does not change the
 #' optimum. Use L2 if you want an effective penalty under simplex constraints.
+#'
+#' PCA is applied after feature selection, pre-shock truncation, lookback
+#' expansion, stacking the target and donors, removal of constant columns,
+#' and the existing `center`/`scale` operations. The available direction
+#' count is `min(nrow(dat), ncol(dat))` for the processed matching matrix
+#' `dat`, as supplied by the default `svd(dat)`. This is a dimension bound,
+#' not a numerical-rank threshold: zero singular values are not filtered and
+#' no automatic component selection is performed. The existing restriction
+#' against PCA with only one remaining feature is retained. `NULL` leaves
+#' the unprojected matching path unchanged; PCA does not force centering.
+#'
+#' Donor weights are optimized in the common PC score space, not taken from
+#' explained-variance proportions. The return structure and optimizer-status
+#' reporting are unchanged, including `"failed_convergence"` when reported
+#' by the solver. Explicit PCA prediction calls to `SynthPrediction()`
+#' additionally reject unsuccessful status or unusable weights.
 #'
 #' @examples
 #' \donttest{
@@ -85,6 +105,12 @@ dbw <- function(
     inputted_transformation = base::identity,
     verbose = FALSE
 ) {
+  if (!is.null(princ_comp_count) &&
+      (!is.numeric(princ_comp_count) || is.complex(princ_comp_count) ||
+       length(princ_comp_count) != 1L || !is.finite(princ_comp_count) ||
+       princ_comp_count <= 0 || princ_comp_count != floor(princ_comp_count))) {
+    stop("princ_comp_count must be a single finite positive integer.")
+  }
   # ---- basic checks ----
   if (!normchoice %in% c("l1","l2"))
     stop("normchoice must be 'l1' or 'l2'.")
@@ -171,11 +197,17 @@ dbw <- function(
   
   # 9) optional PCA
   if (!is.null(princ_comp_count)) {
-    if (princ_comp_count <= 0) stop("princ_comp_count must be positive.")
-    if (ncol(dat) < princ_comp_count) stop("princ_comp_count exceeds #features.")
     if (ncol(dat) == 1) stop("PCA is not meaningful with 1 column.")
     sv <- svd(dat)
-    dat <- dat %*% sv$v[, 1:princ_comp_count, drop = FALSE]
+    available_directions <- ncol(sv$v)
+    if (princ_comp_count > available_directions) {
+      stop(sprintf(
+        "princ_comp_count requested %s; available %d SVD directions after preprocessing (%d series, %d features).",
+        format(princ_comp_count, scientific = FALSE, trim = TRUE),
+        available_directions, nrow(dat), ncol(dat)
+      ))
+    }
+    dat <- dat %*% sv$v[, seq_len(princ_comp_count), drop = FALSE]
   }
   
   # 10) split target vs donors

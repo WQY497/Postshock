@@ -9,6 +9,9 @@
 ^LICENSE\.md$
 ^scripts$
 ^inst/notes$
-^inst/technical_report$
+^inst/technical_report/(?!Technical_report\.(pdf|Rmd)$|sim-test\.Rmd$|sim_vol_tets\.Rmd$|README\.txt$)
 ^.*\.tar\.gz$
 ^.*\.Rcheck$
+^doc$
+^Meta$
+^data-raw$

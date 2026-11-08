@@ -49,3 +49,6 @@ po/*~
 rsconnect/
 inst/notes/lin2021minimizing.pdf
 .DS_Store
+/inst/doc/
+/doc/
+/Meta/

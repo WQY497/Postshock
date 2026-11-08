@@ -9,7 +9,6 @@ new_svf_mock_fit <- function(
     pred = 0.5,
     omega = NULL,
     omega_se = 0.01,
-    fitted_values = numeric(),
     missing_coefficient = FALSE
 ) {
   structure(
@@ -17,7 +16,6 @@ new_svf_mock_fit <- function(
       pred = as.numeric(pred),
       omega = omega,
       omega_se = omega_se,
-      fitted_values = as.numeric(fitted_values),
       missing_coefficient = isTRUE(missing_coefficient)
     ),
     class = "svf_mock_fit"
@@ -56,8 +54,7 @@ local_svf_mocks <- function(
   next_mock_fit <- function(y, xreg) {
     if (is.null(xreg)) {
       return(new_svf_mock_fit(
-        pred = target_pred,
-        fitted_values = rep(mean(target_pred), length(y))
+        pred = target_pred
       ))
     }
     
@@ -71,7 +68,6 @@ local_svf_mocks <- function(
       pred = 0.25,
       omega = omegas[[donor_index]],
       omega_se = omega_se[[donor_index]],
-      fitted_values = rep(0.25, length(y)),
       missing_coefficient = missing_coefficient
     )
   }
@@ -145,10 +141,6 @@ local_svf_mocks <- function(
     list(pred = rep_len(object$pred, as.integer(n.ahead)))
   }
   
-  fitted_mock <- function(object, ...) {
-    object$fitted_values
-  }
-  
   coeftest_mock <- function(x, ...) {
     coefficient_name <- if (isTRUE(x$missing_coefficient)) {
       "unrelated_coefficient"
@@ -171,7 +163,6 @@ local_svf_mocks <- function(
     dbw = dbw_mock,
     garchx = garchx_mock,
     predict = predict_mock,
-    fitted = fitted_mock,
     coeftest = coeftest_mock,
     .env = frame
   )
@@ -208,8 +199,7 @@ make_svf_args <- function(n_donors = 2L, n = 8L) {
     target_covariates = target_x,
     shock_time_vec = rep(4L, n_total),
     shock_length_vec = rep(2L, n_total),
-    k = 2L,
-    plots = FALSE
+    k = 2L
   )
 }
 

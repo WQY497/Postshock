@@ -2,7 +2,7 @@
 % Please edit documentation in R/SynthPrediction.R
 \name{SynthPrediction}
 \alias{SynthPrediction}
-\title{SynthPrediction — Synthetic Prediction with Donor Balancing & Shock Adjustment}
+\title{SynthPrediction - Synthetic Prediction with Donor Balancing and Shock Adjustment}
 \usage{
 SynthPrediction(
   Y_series_list,
@@ -25,8 +25,6 @@ SynthPrediction(
   user_ic_choice = c("aicc", "aic", "bic")[1],
   stepwise = TRUE,
   approximation = TRUE,
-  plots = TRUE,
-  display_ground_truth_choice = FALSE,
   penalty_lambda = 0,
   penalty_normchoice = "l1",
   control_shocks = NULL,
@@ -46,7 +44,7 @@ target; \code{[[2]]}..\code{[[n+1]]} are donors.}
 Used for DBW features and (optionally) as \code{xreg} in ARIMA. You may pass
 \code{Y_series_list} here as a simple baseline.}
 
-\item{shock_time_vec}{Vector of shock start times, each either a time index present
+\item{shock_time_vec}{Vector of last pre-shock boundaries, each either a time index present
 in the corresponding series or a positive integer row number. Length must equal
 \code{length(Y_series_list)}.}
 
@@ -62,14 +60,25 @@ If \code{NULL}, informative columns are auto-selected at pre-shock rows.}
 
 \item{use_dbw}{Logical; if \code{FALSE}, use equal donor weights; otherwise use \code{dbw}.}
 
-\item{princ_comp_input}{Optional PCA dimension for \code{dbw} (forwarded only).}
+\item{princ_comp_input}{\code{NULL} or a single finite positive integer,
+forwarded as \code{dbw(princ_comp_count = princ_comp_input)} when DBW is
+enabled. Invalid or unavailable dimensions cause an error. The direction
+limit follows the processed matching matrix described in \code{\link{dbw}}.
+Single-pool \code{use_dbw=FALSE} ignores this unused setting.}
 
 \item{covariate_indices}{Integer vector of columns from
 \code{covariates_series_list[[i]]} to include as \code{xreg} in ARIMA
 (lagged for the target; contemporaneous for donors). If \code{NULL}, donors use only
-the post-shock indicator and the target uses no \code{xreg}.}
+the post-shock indicator and the target uses only any supplied controls.
+With extra donor covariates, selected X and Y must be finite, complete and
+row-aligned throughout the original donor fitting window. Invalid rows,
+columns or indexed dates cause an error before fitting or fallback.}
 
-\item{geometric_sets, days_before_shocktime_vec}{Reserved (ignored).}
+\item{geometric_sets}{Reserved and ignored; retained for compatibility.}
+
+\item{days_before_shocktime_vec}{Single lookback length for DBW, not a
+per-series vector. \code{NULL} uses the last pre-shock row; a positive length
+uses that many observations backwards from each boundary.}
 
 \item{arima_order}{Optional fixed ARIMA order \code{c(p,d,q)} for all series;
 if \code{NULL}, \code{forecast::auto.arima()} is used.}
@@ -77,30 +86,37 @@ if \code{NULL}, \code{forecast::auto.arima()} is used.}
 \item{seasonal}{Logical: whether seasonal models are allowed/requested. Default \code{TRUE}.}
 
 \item{seasonal_order}{Optional seasonal order \code{c(P,D,Q)} used only when
-\code{arima_order} is supplied and seasonal detection is \code{TRUE}.}
+\code{arima_order} is supplied and the chosen period exceeds one. Ignored
+during automatic order selection.}
 
-\item{seasonal_period}{Optional seasonal period. If \code{NULL} and \code{seasonal=TRUE},
-it is auto-detected per series via \code{findfrequency()}.}
+\item{seasonal_period}{Optional single finite positive integer in observation
+steps, not calendar units. With \code{seasonal=TRUE}, an explicit period is
+used or \code{NULL} detects it per fitting window via \code{findfrequency()}.
+Period one disables seasonal search. The parameter is ignored when
+\code{seasonal=FALSE}; user periods are not rounded.}
 
 \item{user_ic_choice}{Information criterion for \code{auto.arima}
 (\code{"aicc"}, \code{"aic"}, \code{"bic"}).}
 
 \item{stepwise, approximation}{Passed through to \code{forecast::auto.arima()}.}
 
-\item{plots}{Logical; if \code{TRUE} and a function named
-\code{plot_maker_synthprediction} exists, it is called to visualize results.}
-
-\item{display_ground_truth_choice}{Logical; forwarded to the plotting helper if it exists.}
-
 \item{penalty_lambda}{Numeric L1/L2 penalty forwarded to \code{dbw}.}
 
 \item{penalty_normchoice}{Character \code{"l1"} or \code{"l2"}; forwarded to \code{dbw}.}
 
-\item{control_shocks}{Optional list of shock specifications to control for (remove) in the
-target series model. Typically \code{list(list(time=..., length=..., shape=...))}.}
+\item{control_shocks}{Optional series-level list; only its first element is
+used for historical target controls. For one point control, use
+\code{list(list(list(time=3, length=1, shape="point")))}. The first element
+can also be a specification or data frame accepted by \code{build_control_xreg}.
+Future control values are zero; donors do not receive these controls.}
 
 \item{pools}{Optional named list of donor pools. If provided, the call is
-dispatched to \code{SynthPredictionMultiPool()}.}
+dispatched to \code{SynthPredictionMultiPool()}.
+The PCA setting \code{princ_comp_input} is forwarded; each internal call
+uses PCA only when its existing \code{base_use_dbw} or \code{pool_use_dbw}
+switch enables DBW. If both switches are false, PCA is not evaluated.
+Common matching, ARIMA, seasonal, penalty and control settings are forwarded
+unchanged. Single-pool \code{use_dbw} does not override the MultiPool switches.}
 
 \item{pool_agg}{Aggregation rule across pools ("sum" or "weighted").}
 
@@ -109,13 +125,18 @@ dispatched to \code{SynthPredictionMultiPool()}.}
 \item{base_use_dbw}{Logical. Whether DBW is used in the baseline forecast.}
 
 \item{pool_use_dbw}{Logical. Whether DBW is used within each pool.}
+
+\item{...}{Additional arguments passed to
+\code{\link{SynthPredictionMultiPool}} when \code{pools} is supplied.}
 }
 \value{
 A list with components:
 \itemize{
-\item \code{linear_combinations} — numeric donor weights \eqn{W}.
-\item \code{predictions} — list with numeric vectors \code{unadjusted}, \code{adjusted}, \code{arithmetic_mean}.
-\item \code{meta} — metadata (weights, shock timing, ARIMA orders, IC used, etc.).
+\item \code{linear_combinations}: numeric donor weights \eqn{W}.
+\item \code{predictions}: list with numeric vectors \code{unadjusted}, \code{adjusted},
+and \code{arithmetic_mean}.
+\item \code{meta}: metadata including weights, shock timing, ARIMA orders,
+and the information criterion used.
 }
 
 If \code{pools} is provided, the function dispatches to
@@ -130,8 +151,38 @@ with a post-shock indicator; (2) combining donor effects by weights
 by the weighted donor effect. Indices across lists are assumed aligned.
 
 \strong{Seasonality:} \code{seasonal=TRUE} by default. For \emph{each} series, seasonality
-is enabled only if \code{forecast::findfrequency()} detects a frequency > 1
-(NA or <= 1 disables seasonality for that series).
+uses an explicit period or \code{forecast::findfrequency()} on that series'
+fitting window. Periods above one enable seasonal search; otherwise it is off.
+}
+\details{
+With an explicit PCA request and DBW enabled, preprocessing, SVD and DBW
+errors stop prediction instead of falling back to equal weights. An empty
+matching feature set also causes an error. A DBW result must report the
+string \code{"convergence"} and supply one finite real numeric weight per
+donor. Its weights must satisfy the existing simplex constraints, allowing
+absolute tolerances of \code{1e-7} on each bound and \code{1e-6} on the
+sum-to-one constraint. Weights are neither clipped nor renormalized.
+These tolerances match the existing DBW regression checks and accommodate
+numerical residuals from the unchanged solver tolerance of \code{1e-8}.
+The DBW weights, not PC explained-variance proportions, aggregate donor
+effects. With \code{princ_comp_input=NULL}, the existing warning, fallback
+and returned-status behavior is preserved.
+
+Extra donor ARIMAX regressors are checked on rows 1 through boundary plus
+shock length. No rows are omitted or imputed. Errors identify the donor,
+affected variable, original row and available date/time; only selected
+columns and the fitting window are checked. Indexed Y and X must agree
+within a donor; calendars across historical donors need not agree. Unindexed
+inputs use positional alignment. Target lagged-regressor handling is unchanged.
+
+For automatic ARIMA, the selected or detected period is carried by the
+univariate response's \code{ts} frequency. Numerical observations, order
+and window length are unchanged. Existing input frequency is not a separate
+priority: this interface uses its explicit-period or per-window detection
+rule. No calendar gaps are filled. The target's forecast-period response
+is not used for detection. A donor automatic-fit error retains the original
+non-seasonal ARIMA(1,1,1) fallback, with a warning; input validation errors
+are not caught by this fallback.
 }
 \examples{
 \donttest{
@@ -151,8 +202,7 @@ out <- SynthPrediction(
    covariates_series_list = X,
    shock_time_vec = shock_time,
    shock_length_vec = shock_len,
-   k = 2,
-   plots = FALSE
+   k = 2
 )
 str(out$predictions)
 }
